@@ -76,6 +76,9 @@ pub struct PgConnectionInner {
     pub(crate) transaction_depth: usize,
 
     log_settings: LogSettings,
+    close_unnamed_portal: bool,
+    close_named_statements: bool,
+    allow_missing_parse_complete: bool,
 }
 
 pub(crate) struct TableData {
@@ -213,6 +216,11 @@ impl Connection for PgConnection {
         let mut cleared = 0_usize;
 
         self.wait_until_ready().await?;
+
+        if !self.inner.close_named_statements {
+            self.inner.cache_statement.clear();
+            return Ok(());
+        }
 
         while let Some((id, _)) = self.inner.cache_statement.remove_lru() {
             self.inner.stream.write_msg(Close::Statement(id))?;

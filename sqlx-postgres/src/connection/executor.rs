@@ -63,16 +63,34 @@ async fn prepare(
     conn.inner.stream.flush().await?;
 
     // indicates that the SQL query string is now successfully parsed and has semantic validity
-    conn.inner.stream.recv_expect::<ParseComplete>().await?;
+    // with `allow_missing_parse_complete`, a proxy may skip straight to the next expected message
+    let next_format = if metadata.is_some() {
+        BackendMessageFormat::ReadyForQuery
+    } else {
+        BackendMessageFormat::ParameterDescription
+    };
+    let message = conn.inner.stream.recv().await?;
+    let skipped = if conn.inner.allow_missing_parse_complete && message.format == next_format {
+        Some(message)
+    } else {
+        message.decode::<ParseComplete>()?;
+        None
+    };
 
     let metadata = if let Some(metadata) = metadata {
         // each SYNC produces one READY FOR QUERY
-        conn.recv_ready_for_query().await?;
+        match skipped {
+            Some(message) => conn.handle_ready_for_query(message)?,
+            None => conn.recv_ready_for_query().await?,
+        }
 
         // we already have metadata
         metadata
     } else {
-        let parameters = recv_desc_params(conn).await?;
+        let parameters = match skipped {
+            Some(message) => message.decode()?,
+            None => recv_desc_params(conn).await?,
+        };
 
         let row_desc = recv_desc_rows(conn).await?;
 
@@ -182,7 +200,12 @@ impl PgConnection {
         .await?;
 
         if persistent && self.inner.cache_statement.is_enabled() {
-            if let Some((id, _)) = self.inner.cache_statement.insert(sql, statement.clone()) {
+            if let Some((id, _)) = self
+                .inner
+                .cache_statement
+                .insert(sql, statement.clone())
+                .filter(|_| self.inner.close_named_statements)
+            {
                 self.inner.stream.write_msg(Close::Statement(id))?;
                 self.write_sync();
 
@@ -266,9 +289,11 @@ impl PgConnection {
 
             // we ask the database server to close the unnamed portal and free the associated resources
             // earlier - after the execution of the current query.
-            self.inner
-                .stream
-                .write_msg(Close::Portal(PortalId::UNNAMED))?;
+            if self.inner.close_unnamed_portal {
+                self.inner
+                    .stream
+                    .write_msg(Close::Portal(PortalId::UNNAMED))?;
+            }
 
             // finally, [Sync] asks postgres to process the messages that we sent and respond with
             // a [ReadyForQuery] message when it's completely done. Theoretically, we could send

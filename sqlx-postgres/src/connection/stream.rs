@@ -13,7 +13,7 @@ use crate::message::{
     BackendMessage, BackendMessageFormat, EncodeMessage, FrontendMessage, Notice, Notification,
     ParameterStatus, ReceivedMessage,
 };
-use crate::net::{self, BufferedSocket, Socket};
+use crate::net::{self, BufferedSocket, Socket, WithSocket};
 use crate::{PgConnectOptions, PgDatabaseError, PgSeverity};
 
 // the stream is a separate type from the connection to uphold the invariant where an instantiated
@@ -42,9 +42,15 @@ pub struct PgStream {
 
 impl PgStream {
     pub(super) async fn connect(options: &PgConnectOptions) -> Result<Self, Error> {
-        let socket_result = match options.fetch_socket() {
-            Some(ref path) => net::connect_uds(path, MaybeUpgradeTls(options)).await?,
-            None => net::connect_tcp(&options.host, options.port, MaybeUpgradeTls(options)).await?,
+        let socket_result = if let Some(factory) = &options.socket_factory {
+            let socket = factory.0().await?;
+            MaybeUpgradeTls(options)
+                .with_socket(FactorySocket(socket))
+                .await
+        } else if let Some(path) = options.fetch_socket() {
+            net::connect_uds(path, MaybeUpgradeTls(options)).await?
+        } else {
+            net::connect_tcp(&options.host, options.port, MaybeUpgradeTls(options)).await?
         };
 
         let socket = socket_result?;
@@ -278,5 +284,43 @@ mod tests {
         assert_eq!(parse_server_version("13devel87"), Some(130000));
         // unknown
         assert_eq!(parse_server_version("unknown"), None);
+    }
+}
+
+// A concrete transport type keeps TLS's generic future independent of the
+// factory's erased socket type. Passing the `Box<dyn Socket>` itself fails with
+// "implementation of `Send` is not general enough".
+struct FactorySocket(Box<dyn Socket>);
+
+impl Socket for FactorySocket {
+    fn try_read(&mut self, buf: &mut dyn crate::io::ReadBuf) -> std::io::Result<usize> {
+        self.0.try_read(buf)
+    }
+    fn try_write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.try_write(buf)
+    }
+    fn poll_read_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        self.0.poll_read_ready(cx)
+    }
+    fn poll_write_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        self.0.poll_write_ready(cx)
+    }
+    fn poll_flush(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        self.0.poll_flush(cx)
+    }
+    fn poll_shutdown(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        self.0.poll_shutdown(cx)
     }
 }

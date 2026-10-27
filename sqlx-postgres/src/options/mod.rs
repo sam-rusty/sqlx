@@ -1,7 +1,14 @@
 use std::borrow::Cow;
 use std::env::var;
 use std::fmt::{self, Display, Write};
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use crate::error::Error;
+use crate::net::Socket;
+use futures_core::future::BoxFuture;
+use futures_util::TryFutureExt;
 
 pub use ssl_mode::PgSslMode;
 
@@ -30,6 +37,21 @@ pub struct PgConnectOptions {
     pub(crate) log_settings: LogSettings,
     pub(crate) extra_float_digits: Option<Cow<'static, str>>,
     pub(crate) options: Option<String>,
+    pub(crate) socket_factory: Option<SocketFactory>,
+    pub(crate) close_unnamed_portal: bool,
+    pub(crate) close_named_statements: bool,
+    pub(crate) allow_missing_parse_complete: bool,
+}
+
+#[derive(Clone)]
+pub(crate) struct SocketFactory(
+    pub(crate) Arc<dyn Fn() -> BoxFuture<'static, Result<Box<dyn Socket>, Error>> + Send + Sync>,
+);
+
+impl fmt::Debug for SocketFactory {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("SocketFactory(..)")
+    }
 }
 
 impl Default for PgConnectOptions {
@@ -97,7 +119,66 @@ impl PgConnectOptions {
             extra_float_digits: Some("2".into()),
             log_settings: Default::default(),
             options: var("PGOPTIONS").ok(),
+            socket_factory: None,
+            close_unnamed_portal: true,
+            close_named_statements: true,
+            allow_missing_parse_complete: false,
         }
+    }
+
+    /// Supplies an already-connected transport for every new physical connection.
+    ///
+    /// This bypasses SQLx's DNS and socket creation, including when these options
+    /// are used with a pool. The factory must return a new independent socket on
+    /// each call. It must not retain request-owned sockets across requests.
+    ///
+    /// SQLx still negotiates TLS according to `ssl_mode`, using `host` for the TLS
+    /// server name, and performs normal PostgreSQL startup and authentication.
+    /// A factory for a platform binding may supply a transport secured by that
+    /// platform; configure its TLS policy explicitly for that transport.
+    ///
+    /// The factory is process-local and is not represented by `to_url_lossy()`.
+    pub fn socket_factory<F, Fut, S>(mut self, factory: F) -> Self
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<S, Error>> + Send + 'static,
+        S: Socket,
+    {
+        self.socket_factory = Some(SocketFactory(Arc::new(move || {
+            Box::pin(factory().map_ok(|socket| Box::new(socket) as Box<dyn Socket>))
+        })));
+        self
+    }
+
+    /// Controls eager cleanup of the unnamed portal after each execution.
+    ///
+    /// Defaults to true. Some transaction-pooling proxies reject Close Portal
+    /// between Execute and Sync. Disabling it leaves the unnamed portal to be
+    /// destroyed by transaction end, the next unnamed Bind, or a simple Query,
+    /// as specified by PostgreSQL. Named statement cleanup is unchanged.
+    /// Execution still uses limit=0; result decoding and type checks are unchanged.
+    pub fn close_unnamed_portal(mut self, enabled: bool) -> Self {
+        self.close_unnamed_portal = enabled;
+        self
+    }
+
+    /// Allows a proxy to omit ParseComplete if the next message is the
+    /// expected ParameterDescription (or ReadyForQuery when reusing metadata).
+    /// Defaults to false. Error responses, parameter/row metadata, and all
+    /// subsequent protocol and decoding checks remain mandatory.
+    pub fn allow_missing_parse_complete(mut self, enabled: bool) -> Self {
+        self.allow_missing_parse_complete = enabled;
+        self
+    }
+
+    /// Controls Close Statement messages on local cache eviction or clearing.
+    /// Defaults to true. Disable only for proxies which reject these messages
+    /// and own backend statement cleanup. With false, clearing the SQLx cache
+    /// only clears client metadata; server resources are not eagerly freed.
+    /// Use request-scoped client connections so their lifetime stays bounded.
+    pub fn close_named_statements(mut self, enabled: bool) -> Self {
+        self.close_named_statements = enabled;
+        self
     }
 
     pub(crate) fn apply_pgpass(mut self) -> Self {

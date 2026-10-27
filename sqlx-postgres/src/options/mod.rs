@@ -34,6 +34,7 @@ pub struct PgConnectOptions {
     pub(crate) ssl_client_key: Option<CertificateInput>,
     pub(crate) statement_cache_capacity: usize,
     pub(crate) application_name: Option<String>,
+    pub(crate) timezone: Option<Cow<'static, str>>,
     pub(crate) log_settings: LogSettings,
     pub(crate) extra_float_digits: Option<Cow<'static, str>>,
     pub(crate) options: Option<String>,
@@ -115,6 +116,7 @@ impl PgConnectOptions {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or_default(),
             statement_cache_capacity: 100,
+            timezone: Some("UTC".into()),
             application_name: var("PGAPPNAME").ok(),
             extra_float_digits: Some("2".into()),
             log_settings: Default::default(),
@@ -446,6 +448,26 @@ impl PgConnectOptions {
     /// ```
     pub fn application_name(mut self, application_name: &str) -> Self {
         self.application_name = Some(application_name.to_owned());
+        self
+    }
+
+    /// Sets or removes the `TimeZone` sent in the startup packet.
+    ///
+    /// Defaults to `Some("UTC")`. With `None` the parameter is not sent, so the session
+    /// starts on the role's or database's default (`ALTER ROLE .. SET TimeZone`).
+    ///
+    /// Setting `TimeZone` through [`options`][Self::options] does not override this:
+    /// the server applies `options` before the startup parameters.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use sqlx_postgres::PgConnectOptions;
+    /// let options = PgConnectOptions::new()
+    ///     .timezone(None::<&str>);
+    /// ```
+    pub fn timezone(mut self, timezone: Option<impl Into<Cow<'static, str>>>) -> Self {
+        self.timezone = timezone.map(Into::into);
         self
     }
 

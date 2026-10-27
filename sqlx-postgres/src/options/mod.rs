@@ -39,6 +39,7 @@ pub struct PgConnectOptions {
     pub(crate) extra_float_digits: Option<Cow<'static, str>>,
     pub(crate) options: Option<String>,
     pub(crate) socket_factory: Option<SocketFactory>,
+    pub(crate) shared_type_cache: Option<Arc<crate::PgTypeCache>>,
     pub(crate) close_unnamed_portal: bool,
     pub(crate) close_named_statements: bool,
     pub(crate) allow_missing_parse_complete: bool,
@@ -122,6 +123,7 @@ impl PgConnectOptions {
             log_settings: Default::default(),
             options: var("PGOPTIONS").ok(),
             socket_factory: None,
+            shared_type_cache: None,
             close_unnamed_portal: true,
             close_named_statements: true,
             allow_missing_parse_complete: false,
@@ -149,6 +151,16 @@ impl PgConnectOptions {
         self.socket_factory = Some(SocketFactory(Arc::new(move || {
             Box::pin(factory().map_ok(|socket| Box::new(socket) as Box<dyn Socket>))
         })));
+        self
+    }
+
+    /// Shares resolved type metadata (custom types looked up in `pg_type`) between every
+    /// connection made with these options, and any others given the same cache.
+    ///
+    /// Use one [`PgTypeCache`][crate::PgTypeCache] per database. By default each
+    /// connection has its own cache.
+    pub fn shared_type_cache(mut self, cache: Arc<crate::PgTypeCache>) -> Self {
+        self.shared_type_cache = Some(cache);
         self
     }
 

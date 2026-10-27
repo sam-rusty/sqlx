@@ -3,6 +3,7 @@ use crate::error::Error;
 use crate::ext::ustr::UStr;
 use crate::message::{ParameterDescription, RowDescription};
 use crate::statement::PgStatementMetadata;
+use crate::type_cache::TypeMaps;
 use crate::type_info::{PgCustomType, PgType, PgTypeKind};
 use crate::types::Oid;
 use crate::{HashMap, PgRow, PgValueRef, Postgres};
@@ -38,6 +39,14 @@ impl PgConnection {
         let fields = row_desc.map_or_else(Default::default, |desc| desc.fields);
 
         if QUERIES_ALLOWED {
+            if param_types
+                .iter()
+                .chain(fields.iter().map(|field| &field.data_type_id))
+                .any(|oid| self.try_oid_to_type(*oid).is_none())
+            {
+                self.pull_shared_types();
+            }
+
             let mut type_resolver = TypeResolver::default();
             let mut column_resolver = ColumnResolver::default();
 
@@ -135,6 +144,10 @@ impl PgConnection {
     }
 
     pub(crate) async fn resolve_types(&mut self, types: &[PgTypeInfo]) -> Result<Vec<Oid>, Error> {
+        if types.iter().any(|ty| self.try_type_to_oid(ty).is_none()) {
+            self.pull_shared_types();
+        }
+
         let mut oids = Vec::with_capacity(types.len());
 
         let mut unresolved_types = types.iter().peekable();
@@ -211,7 +224,41 @@ impl PgConnection {
         }
     }
 
-    fn try_oid_to_type(&self, oid: Oid) -> Option<PgTypeInfo> {
+    /// Copies what other connections resolved into this connection's type cache.
+    /// Returns whether anything was new.
+    pub(crate) fn pull_shared_types(&mut self) -> bool {
+        let Some(shared) = self.inner.shared_type_cache.clone() else {
+            return false;
+        };
+        let shared = shared.lock();
+        let mut local = TypeMaps {
+            type_oid: mem::take(&mut self.inner.cache_type_oid),
+            type_info: mem::take(&mut self.inner.cache_type_info),
+            elem_type_to_array: mem::take(&mut self.inner.cache_elem_type_to_array),
+        };
+        let changed = local.merge_from(
+            &shared.type_oid,
+            &shared.type_info,
+            &shared.elem_type_to_array,
+        );
+        self.inner.cache_type_oid = local.type_oid;
+        self.inner.cache_type_info = local.type_info;
+        self.inner.cache_elem_type_to_array = local.elem_type_to_array;
+        changed
+    }
+
+    /// Writes what this connection resolved to the shared type cache.
+    fn push_shared_types(&self) {
+        if let Some(shared) = &self.inner.shared_type_cache {
+            shared.lock().merge_from(
+                &self.inner.cache_type_oid,
+                &self.inner.cache_type_info,
+                &self.inner.cache_elem_type_to_array,
+            );
+        }
+    }
+
+    pub(crate) fn try_oid_to_type(&self, oid: Oid) -> Option<PgTypeInfo> {
         PgTypeInfo::try_from_oid(oid).or_else(|| self.inner.cache_type_info.get(&oid).cloned())
     }
 
@@ -397,6 +444,10 @@ impl TypeResolver {
     }
 
     async fn fill_cache(&mut self, conn: &mut PgConnection) -> Result<(), Error> {
+        if self.query.is_empty() {
+            return Ok(());
+        }
+
         let mut missing_dependencies = HashMap::<Oid, Vec<TypeResolverRow>>::new();
 
         // Iteratively resolve types until all are resolved, or we hit a dead-end.
@@ -468,6 +519,9 @@ impl TypeResolver {
                 }
             }
         }
+
+        // what did resolve is kept even if something did not
+        conn.push_shared_types();
 
         if !missing_dependencies.is_empty() {
             return Err(Error::Protocol(format!(

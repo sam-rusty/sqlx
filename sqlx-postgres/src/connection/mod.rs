@@ -16,7 +16,7 @@ use crate::message::{
 use crate::statement::PgStatementMetadata;
 use crate::transaction::Transaction;
 use crate::types::Oid;
-use crate::{PgConnectOptions, PgTypeInfo, Postgres};
+use crate::{PgConnectOptions, PgTypeCache, PgTypeInfo, Postgres};
 
 pub(crate) use sqlx_core::connection::*;
 use sqlx_core::sql_str::SqlSafeStr;
@@ -67,6 +67,7 @@ pub struct PgConnectionInner {
     cache_type_oid: HashMap<UStr, Oid>,
     cache_elem_type_to_array: HashMap<Oid, Oid>,
     cache_table_data: HashMap<Oid, TableData>,
+    shared_type_cache: Option<Arc<PgTypeCache>>,
 
     // number of ReadyForQuery messages that we are currently expecting
     pub(crate) pending_ready_for_query_count: usize,

@@ -311,7 +311,13 @@ impl<DB: Database> Floating<DB, Live<DB>> {
         // returned to the pool; also of course, if it was dropped due to an error
         // this is simply a band-aid as SQLx-next connections should be able
         // to recover from cancellations
-        if let Err(error) = self.raw.ping().await {
+        let ready = if self.guard.pool.options.test_on_release {
+            self.raw.ping().await
+        } else {
+            self.raw.flush().await
+        };
+
+        if let Err(error) = ready {
             tracing::warn!(
                 %error,
                 "error occurred while testing the connection on-release",

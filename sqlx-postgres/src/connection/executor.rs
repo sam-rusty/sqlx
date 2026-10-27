@@ -184,17 +184,24 @@ impl PgConnection {
         // a statement object
         metadata: Option<Arc<PgStatementMetadata>>,
         resolve_column_origin: bool,
+        // name the statement even when it will not be cached
+        // (`describe` needs a named statement for `EXPLAIN EXECUTE`)
+        force_named: bool,
     ) -> Result<(StatementId, Arc<PgStatementMetadata>), Error> {
         if let Some(statement) = self.inner.cache_statement.get_mut(sql) {
             return Ok((*statement).clone());
         }
+
+        // A named statement that is not cached would never be closed: with the statement
+        // cache disabled, statements are unnamed.
+        let named = force_named || (persistent && self.inner.cache_statement.is_enabled());
 
         let statement = prepare(
             self,
             sql,
             parameters,
             metadata,
-            persistent,
+            named,
             resolve_column_origin,
         )
         .await?;
@@ -251,7 +258,7 @@ impl PgConnection {
             // prepare the statement if this our first time executing it
             // always return the statement ID here
             let (statement, metadata_) = self
-                .get_or_prepare(sql, &arguments.types, persistent, metadata_opt, false)
+                .get_or_prepare(sql, &arguments.types, persistent, metadata_opt, false, false)
                 .await?;
 
             metadata = metadata_;
@@ -478,7 +485,7 @@ impl<'c> Executor<'c> for &'c mut PgConnection {
             self.wait_until_ready().await?;
 
             let (_, metadata) = self
-                .get_or_prepare(sql.as_str(), parameters, true, None, true)
+                .get_or_prepare(sql.as_str(), parameters, true, None, true, false)
                 .await?;
 
             Ok(PgStatement { sql, metadata })
@@ -497,10 +504,21 @@ impl<'c> Executor<'c> for &'c mut PgConnection {
             self.wait_until_ready().await?;
 
             let (stmt_id, metadata) = self
-                .get_or_prepare(sql.as_str(), &[], true, None, true)
+                .get_or_prepare(sql.as_str(), &[], true, None, true, true)
                 .await?;
 
             let nullable = self.get_nullable_for_columns(stmt_id, &metadata).await?;
+
+            // not cached: close it now, nothing else would
+            if !self.inner.cache_statement.contains_key(sql.as_str())
+                && self.inner.close_named_statements
+            {
+                self.inner.stream.write_msg(Close::Statement(stmt_id))?;
+                self.write_sync();
+                self.inner.stream.flush().await?;
+                self.wait_for_close_complete(1).await?;
+                self.recv_ready_for_query().await?;
+            }
 
             Ok(crate::describe::Describe {
                 columns: metadata.columns.clone(),

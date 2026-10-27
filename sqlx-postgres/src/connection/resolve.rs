@@ -258,6 +258,19 @@ impl PgConnection {
         }
     }
 
+    /// Whether a column of `row_desc` has a type neither built in nor known to this
+    /// connection or its shared type cache.
+    pub(crate) fn has_unknown_types(&mut self, row_desc: &RowDescription) -> bool {
+        let unknown = |conn: &Self| {
+            row_desc
+                .fields
+                .iter()
+                .any(|field| conn.try_oid_to_type(field.data_type_id).is_none())
+        };
+
+        unknown(self) && (!self.pull_shared_types() || unknown(self))
+    }
+
     pub(crate) fn try_oid_to_type(&self, oid: Oid) -> Option<PgTypeInfo> {
         PgTypeInfo::try_from_oid(oid).or_else(|| self.inner.cache_type_info.get(&oid).cloned())
     }

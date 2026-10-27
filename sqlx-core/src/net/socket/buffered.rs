@@ -226,6 +226,14 @@ impl WriteBuffer {
         self.bytes_flushed >= self.bytes_written
     }
 
+    /// Discards everything after the first `len` bytes not yet flushed, such as the
+    /// messages of a batch that failed to encode part-way.
+    pub fn truncate_unflushed(&mut self, len: usize) {
+        self.bytes_written = cmp::min(self.bytes_written, self.bytes_flushed + len);
+        self.buf.truncate(self.bytes_written);
+        self.sanity_check();
+    }
+
     pub fn is_full(&self) -> bool {
         self.bytes_written == self.buf.len()
     }

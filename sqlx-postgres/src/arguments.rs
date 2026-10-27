@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use crate::encode::{Encode, IsNull};
 use crate::error::Error;
-use crate::types::Type;
+use crate::types::{Oid, Type};
 use crate::{PgConnection, PgTypeInfo, Postgres};
 
 pub(crate) use sqlx_core::arguments::Arguments;
@@ -129,6 +129,38 @@ impl PgArguments {
         }
 
         Ok(())
+    }
+
+    /// The declared parameter types followed by the types of the holes, so both resolve
+    /// in one [`PgConnection::resolve_types`] call.
+    pub(crate) fn types_to_resolve(&self) -> Vec<PgTypeInfo> {
+        self.types
+            .iter()
+            .chain(&self.buffer.hole_types)
+            .cloned()
+            .collect()
+    }
+
+    /// [`apply_patches`][Self::apply_patches] with the hole OIDs already resolved, so it
+    /// needs no connection.
+    pub(crate) fn apply_patches_resolved(&mut self, parameters: &[PgTypeInfo], holes: &[Oid]) {
+        let PgArgumentBuffer {
+            ref patches,
+            ref hole_offsets,
+            ref mut buffer,
+            ..
+        } = self.buffer;
+
+        for patch in patches {
+            (patch.callback)(
+                &mut buffer[patch.buf_offset..],
+                &parameters[patch.arg_index],
+            );
+        }
+
+        for (&offset, oid) in hole_offsets.iter().zip(holes) {
+            buffer[offset..][..4].copy_from_slice(&oid.0.to_be_bytes());
+        }
     }
 }
 

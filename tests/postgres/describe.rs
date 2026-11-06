@@ -1,4 +1,5 @@
-use sqlx::{postgres::Postgres, Column, Executor, SqlSafeStr, TypeInfo};
+use sqlx::postgres::{PgConnection, Postgres};
+use sqlx::{AssertSqlSafe, Column, Executor, SqlSafeStr, TypeInfo};
 use sqlx_test::new;
 
 #[sqlx_macros::test]
@@ -94,6 +95,103 @@ async fn it_describes_composite() -> anyhow::Result<()> {
         format!("{:?}", ty.kind()),
         r#"Composite([("name", PgTypeInfo(Text)), ("supplier_id", PgTypeInfo(Int4)), ("price", PgTypeInfo(Int8))])"#
     );
+
+    Ok(())
+}
+
+/// A one-row parent and a thousand-row child. With nested loops and merge joins off, the planner
+/// hashes whichever side is smaller, so the side of the join that gets hashed is under our control.
+async fn outer_join_tables(conn: &mut PgConnection) -> anyhow::Result<()> {
+    sqlx::raw_sql(
+        "CREATE TEMPORARY TABLE nullability_parent (id INT PRIMARY KEY, name TEXT NOT NULL);
+         CREATE TEMPORARY TABLE nullability_child (parent_id INT NOT NULL, name TEXT NOT NULL);
+         INSERT INTO nullability_parent VALUES (1, 'parent');
+         INSERT INTO nullability_child SELECT 1, 'child' FROM generate_series(1, 1000);
+         ANALYZE nullability_parent;
+         ANALYZE nullability_child;
+         SET enable_nestloop = off;
+         SET enable_mergejoin = off;",
+    )
+    .execute(&mut *conn)
+    .await?;
+
+    Ok(())
+}
+
+async fn explain(conn: &mut PgConnection, sql: &str) -> anyhow::Result<String> {
+    let lines = sqlx::query_scalar::<_, String>(AssertSqlSafe(format!("EXPLAIN {sql}")))
+        .fetch_all(&mut *conn)
+        .await?;
+
+    Ok(lines.join("\n"))
+}
+
+#[sqlx_macros::test]
+async fn it_describes_left_join_planned_as_left_join() -> anyhow::Result<()> {
+    let mut conn = new::<Postgres>().await?;
+    outer_join_tables(&mut conn).await?;
+
+    let sql = "SELECT c.name, p.name FROM nullability_child c LEFT JOIN nullability_parent p ON p.id = c.parent_id";
+
+    assert!(explain(&mut conn, sql).await?.contains("Hash Left Join"));
+
+    let d = conn.describe(sql.into_sql_str()).await?;
+
+    assert_eq!(d.nullable(0), Some(false));
+    assert_eq!(d.nullable(1), Some(true));
+
+    Ok(())
+}
+
+#[sqlx_macros::test]
+async fn it_describes_left_join_planned_as_right_join() -> anyhow::Result<()> {
+    let mut conn = new::<Postgres>().await?;
+    outer_join_tables(&mut conn).await?;
+
+    // the planner hashes the smaller, preserved side, so the null-extended side becomes `Outer`
+    let sql = "SELECT p.id, p.name, c.name FROM nullability_parent p LEFT JOIN nullability_child c ON c.parent_id = p.id";
+
+    assert!(explain(&mut conn, sql).await?.contains("Hash Right Join"));
+
+    let d = conn.describe(sql.into_sql_str()).await?;
+
+    assert_eq!(d.nullable(0), Some(false));
+    assert_eq!(d.nullable(1), Some(false));
+    assert_eq!(d.nullable(2), Some(true));
+
+    Ok(())
+}
+
+#[sqlx_macros::test]
+async fn it_describes_outer_join_under_another_node() -> anyhow::Result<()> {
+    let mut conn = new::<Postgres>().await?;
+    outer_join_tables(&mut conn).await?;
+
+    let sql = "SELECT c.name, p.name FROM nullability_child c LEFT JOIN nullability_parent p ON p.id = c.parent_id LIMIT 1";
+
+    assert!(explain(&mut conn, sql).await?.starts_with("Limit"));
+
+    let d = conn.describe(sql.into_sql_str()).await?;
+
+    assert_eq!(d.nullable(0), Some(false));
+    assert_eq!(d.nullable(1), Some(true));
+
+    Ok(())
+}
+
+#[sqlx_macros::test]
+async fn it_describes_full_join() -> anyhow::Result<()> {
+    let mut conn = new::<Postgres>().await?;
+    outer_join_tables(&mut conn).await?;
+
+    let sql = "SELECT p.name, c.name FROM nullability_parent p FULL JOIN nullability_child c ON c.parent_id = p.id";
+
+    assert!(explain(&mut conn, sql).await?.contains("Full Join"));
+
+    let d = conn.describe(sql.into_sql_str()).await?;
+
+    assert_eq!(d.nullable(0), Some(true));
+    assert_eq!(d.nullable(1), Some(true));
 
     Ok(())
 }

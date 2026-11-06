@@ -161,26 +161,43 @@ impl PgConnection {
 }
 
 fn visit_plan(plan: &Plan, outputs: &[String], nullables: &mut Vec<Option<bool>>) {
+    let Some(plans) = &plan.plans else {
+        return;
+    };
+
+    for child in plans {
+        // `Join Type` is the physical join, whose sides can be swapped relative to the query:
+        // the planner often runs `a LEFT JOIN b` as a `Right` join that hashes `a`. The
+        // null-extended child is `Inner` for `Left`, `Outer` for `Right` and both for `Full`.
+        let null_extended = matches!(
+            (plan.join_type.as_deref(), child.parent_relation.as_deref()),
+            (Some("Left"), Some("Inner"))
+                | (Some("Right"), Some("Outer"))
+                | (Some("Full"), Some("Inner" | "Outer"))
+        );
+
+        if null_extended {
+            mark_nullable(child, outputs, nullables);
+        }
+
+        // an outer join can sit under any node: `Sort`, `Limit`, `Aggregate`, an inner join...
+        visit_plan(child, outputs, nullables);
+    }
+}
+
+fn mark_nullable(plan: &Plan, outputs: &[String], nullables: &mut [Option<bool>]) {
     if let Some(plan_outputs) = &plan.output {
-        // all outputs of a Full Join must be marked nullable
-        // otherwise, all outputs of the inner half of an outer join must be marked nullable
-        if plan.join_type.as_deref() == Some("Full")
-            || plan.parent_relation.as_deref() == Some("Inner")
-        {
-            for output in plan_outputs {
-                if let Some(i) = outputs.iter().position(|o| o == output) {
-                    // N.B. this may produce false positives but those don't cause runtime errors
-                    nullables[i] = Some(true);
-                }
+        for output in plan_outputs {
+            if let Some(i) = outputs.iter().position(|o| o == output) {
+                // N.B. this may produce false positives but those don't cause runtime errors
+                nullables[i] = Some(true);
             }
         }
     }
 
     if let Some(plans) = &plan.plans {
-        if let Some("Left") | Some("Right") = plan.join_type.as_deref() {
-            for plan in plans {
-                visit_plan(plan, outputs, nullables);
-            }
+        for child in plans {
+            mark_nullable(child, outputs, nullables);
         }
     }
 }

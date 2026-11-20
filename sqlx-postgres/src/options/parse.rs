@@ -1,6 +1,6 @@
 use crate::error::Error;
-use crate::PgConnectOptions;
-use sqlx_core::percent_encoding::percent_decode_str;
+use crate::{PgConnectOptions, PgSslMode};
+use sqlx_core::percent_encoding::{percent_decode_str, utf8_percent_encode, NON_ALPHANUMERIC};
 use sqlx_core::Url;
 use std::net::IpAddr;
 use std::str::FromStr;
@@ -24,7 +24,7 @@ impl PgConnectOptions {
         let username = url.username();
         if !username.is_empty() {
             options = options.username(
-                &*percent_decode_str(username)
+                &percent_decode_str(username)
                     .decode_utf8()
                     .map_err(Error::config)?,
             );
@@ -32,7 +32,7 @@ impl PgConnectOptions {
 
         if let Some(password) = url.password() {
             options = options.password(
-                &*percent_decode_str(password)
+                &percent_decode_str(password)
                     .decode_utf8()
                     .map_err(Error::config)?,
             );
@@ -40,7 +40,11 @@ impl PgConnectOptions {
 
         let path = url.path().trim_start_matches('/');
         if !path.is_empty() {
-            options = options.database(path);
+            options = options.database(
+                &percent_decode_str(path)
+                    .decode_utf8()
+                    .map_err(Error::config)?,
+            );
         }
 
         for (key, value) in url.query_pairs().into_iter() {
@@ -63,32 +67,31 @@ impl PgConnectOptions {
                 }
 
                 "host" => {
-                    if value.starts_with("/") {
+                    if value.starts_with('/') {
                         options = options.socket(&*value);
                     } else {
-                        options = options.host(&*value);
+                        options = options.host(&value);
                     }
                 }
 
                 "hostaddr" => {
-                    value.parse::<IpAddr>().map_err(Error::config)?;
-                    options = options.host(&*value)
+                    options = options.hostaddr(value.parse::<IpAddr>().map_err(Error::config)?);
                 }
 
                 "port" => options = options.port(value.parse().map_err(Error::config)?),
 
-                "dbname" => options = options.database(&*value),
+                "dbname" => options = options.database(&value),
 
-                "user" => options = options.username(&*value),
+                "user" => options = options.username(&value),
 
-                "password" => options = options.password(&*value),
+                "password" => options = options.password(&value),
 
-                "application_name" => options = options.application_name(&*value),
+                "application_name" => options = options.application_name(&value),
 
                 "options" => {
                     if let Some(options) = options.options.as_mut() {
                         options.push(' ');
-                        options.push_str(&*value);
+                        options.push_str(&value);
                     } else {
                         options.options = Some(value.to_string());
                     }
@@ -107,6 +110,72 @@ impl PgConnectOptions {
         let options = options.apply_pgpass();
 
         Ok(options)
+    }
+
+    pub(crate) fn build_url(&self) -> Url {
+        let url_raw = match &self.socket {
+            Some(socket) => {
+                format!(
+                    "postgres://{}@{}:{}",
+                    self.username,
+                    utf8_percent_encode(&socket.to_string_lossy(), NON_ALPHANUMERIC),
+                    self.port
+                )
+            }
+            None => format!("postgres://{}@{}:{}", self.username, self.host, self.port),
+        };
+
+        let mut url = Url::parse(&url_raw)
+            .unwrap_or_else(|e| panic!("BUG: generated un-parseable URL {url_raw:?}; error: {e}"));
+
+        if let Some(password) = &self.password {
+            let password = utf8_percent_encode(password, NON_ALPHANUMERIC).to_string();
+            let _ = url.set_password(Some(&password));
+        }
+
+        if let Some(database) = &self.database {
+            url.set_path(database);
+        }
+
+        let mut url_query = url.query_pairs_mut();
+
+        if let Some(hostaddr) = self.hostaddr {
+            url_query.append_pair("hostaddr", &hostaddr.to_string());
+        }
+
+        let ssl_mode = match self.ssl_options.ssl_mode {
+            PgSslMode::Allow => "allow",
+            PgSslMode::Disable => "disable",
+            PgSslMode::Prefer => "prefer",
+            PgSslMode::Require => "require",
+            PgSslMode::VerifyCa => "verify-ca",
+            PgSslMode::VerifyFull => "verify-full",
+        };
+
+        url_query.append_pair("sslmode", ssl_mode);
+
+        if let Some(ssl_root_cert) = &self.ssl_options.ssl_root_cert {
+            url_query.append_pair("sslrootcert", &ssl_root_cert.to_string());
+        }
+
+        if let Some(ssl_client_cert) = &self.ssl_options.ssl_client_cert {
+            url_query.append_pair("sslcert", &ssl_client_cert.to_string());
+        }
+
+        if let Some(ssl_client_key) = &self.ssl_options.ssl_client_key {
+            url_query.append_pair("sslkey", &ssl_client_key.to_string());
+        }
+
+        url_query.append_pair(
+            "statement-cache-capacity",
+            &self.statement_cache_capacity.to_string(),
+        );
+
+        url_query.finish();
+
+        drop(url_query);
+
+        url
     }
 }
 
@@ -134,7 +203,7 @@ fn it_parses_host_correctly_from_parameter() {
     let opts = PgConnectOptions::from_str(url).unwrap();
 
     assert_eq!(None, opts.socket);
-    assert_eq!("google.database.com", &opts.host);
+    assert_eq!("google.database.com", opts.host.original());
 }
 
 #[test]
@@ -143,7 +212,8 @@ fn it_parses_hostaddr_correctly_from_parameter() {
     let opts = PgConnectOptions::from_str(url).unwrap();
 
     assert_eq!(None, opts.socket);
-    assert_eq!("8.8.8.8", &opts.host);
+    assert_eq!("localhost", opts.host.original());
+    assert_eq!(Some("8.8.8.8".parse().unwrap()), opts.hostaddr);
 }
 
 #[test]
@@ -240,5 +310,60 @@ fn it_parses_sqlx_options_correctly() {
     assert_eq!(
         Some("-c synchronous_commit=off -c search_path=postgres".into()),
         opts.options
+    );
+}
+
+#[test]
+fn it_returns_the_parsed_url_when_socket() {
+    let url = "postgres://username@%2Fvar%2Flib%2Fpostgres/database";
+    let opts = PgConnectOptions::from_str(url).unwrap();
+
+    let mut expected_url = Url::parse(url).unwrap();
+    // PgConnectOptions defaults
+    let query_string = "sslmode=prefer&statement-cache-capacity=100";
+    let port = 5432;
+    expected_url.set_query(Some(query_string));
+    let _ = expected_url.set_port(Some(port));
+
+    assert_eq!(expected_url, opts.build_url());
+}
+
+#[test]
+fn it_returns_the_parsed_url_when_host() {
+    let url = "postgres://username:p@ssw0rd@hostname:5432/database";
+    let opts = PgConnectOptions::from_str(url).unwrap();
+
+    let mut expected_url = Url::parse(url).unwrap();
+    // PgConnectOptions defaults
+    let query_string = "sslmode=prefer&statement-cache-capacity=100";
+    expected_url.set_query(Some(query_string));
+
+    assert_eq!(expected_url, opts.build_url());
+}
+
+#[test]
+fn built_url_can_be_parsed() {
+    let url = "postgres://username:p@ssw0rd@hostname:5432/database";
+    let opts = PgConnectOptions::from_str(url).unwrap();
+
+    let parsed = PgConnectOptions::from_str(opts.build_url().as_ref());
+
+    assert!(parsed.is_ok());
+}
+
+#[test]
+fn ipv6_url_round_trips() {
+    let url = "postgres://username:p%40ssw0rd@[2001:db8::1]:5432/database";
+
+    let opts = PgConnectOptions::from_str(url).unwrap();
+
+    assert_eq!(opts.host.original(), "[2001:db8::1]");
+    assert_eq!(opts.host.stripped(), "2001:db8::1");
+
+    assert_eq!(
+        opts.build_url().as_str(),
+        // `build_url()` adds some parameters that weren't in the URL originally,
+        // but this should not be harmful
+        "postgres://username:p%40ssw0rd@[2001:db8::1]:5432/database?sslmode=prefer&statement-cache-capacity=100"
     );
 }

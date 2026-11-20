@@ -18,29 +18,80 @@ As a rule, however, we only officially support the range of versions for each da
 For each database and where applicable, we test against the latest and oldest versions that we intend to support. You can see the current versions being tested against by looking at our CI config: https://github.com/launchbadge/sqlx/blob/main/.github/workflows/sqlx.yml#L168
 
 -------------------------------------------------------------------
+<a name="MSRV"></a>
 ### What versions of Rust does SQLx support? What is SQLx's MSRV\*?
 
-Officially, we will only ever support the latest stable version of Rust. 
-It's just not something we consider to be worth keeping track of, given the current state of tooling.
+SQLx's MSRV is the second-to-latest stable release as of the beginning of the current release cycle (`0.x.0`).
+It will remain there until the next major release (`0.{x + 1}.0`).
 
-Cargo does support a [`rust-version`] field now in the package manifest, however that will only ensure
-that the user is using a `rustc` of that version or greater; it does not enforce that the crate's code is
-actually compatible with that version of Rust. That would need to be manually enforced and checked with CI,
-and we have enough CI passes already.
+For example, as of the `0.8.0` release of SQLx, the latest stable Rust version was `1.79.0`, so the MSRV for the
+`0.8.x` release cycle of SQLx is `1.78.0`.
 
-In practice, we tend not to reach for language or library features that are *too* new, either because
-we don't need them or we just worked around their absence. There are language features we're waiting to be
-stabilized that we want to use (Generic Associated Types and Async Traits, to name a couple) which we will
-be utilizing when they're available, but that will be a major refactor with breaking API changes 
-which will then coincide with a major release.
+This guarantees that SQLx will compile with a Rust version that is _at least_ six weeks old, which should be plenty
+of time for it to make it through any packaging system that is being actively kept up to date.
 
-Thus, it is likely that a given SQLx release _will_ work with older versions of Rust. However,
-we make no guarantees about which exact versions it will work with besides the latest stable version,
-and we don't factor MSRV bumps into our semantic versioning.
+We do _not_ recommend installing Rust through operating system packages, 
+as they can often be a whole year or more out-of-date.
 
 \*Minimum Supported Rust Version
 
 [`rust-version`]: https://doc.rust-lang.org/stable/cargo/reference/manifest.html#the-rust-version-field
+
+----------------------------------------------------------------
+
+### Can SQLx Add Support for New Databases?
+
+We are always open to discuss adding support for new databases, but as of writing, have no plans to in the short term.
+
+Implementing support for a new database in SQLx is a _huge_ lift. Expecting this work to be done for free is highly unrealistic.  
+In all likelihood, the implementation would need to be written from scratch.  
+Even if Rust bindings exist, they may not support `async`.  
+Even if they support `async`, they may only support either Tokio or `async-std`, and not both.  
+Even if they support Tokio and `async-std`, the API may not be flexible enough or provide sufficient information (e.g. for implementing the macros).
+
+If we have to write the implementation from scratch, is the protocol publicly documented, and stable?
+
+Even if everything is supported on the client side, how will we run tests against the database? Is it open-source, or proprietary? Will it require a paid license?
+
+For example, Oracle Database's protocol is proprietary and only supported through their own libraries, which do not support Rust, and only have blocking APIs (see: [Oracle Call Interface for C](https://docs.oracle.com/en/database/oracle/oracle-database/23/lnoci/index.html)).
+This makes it a poor candidate for an async-native crate like SQLx--though we support SQLite, which also only has a blocking API, that's the exception and not the rule. Wrapping blocking APIs is not very scalable.
+
+We still have plans to bring back the MSSQL driver, but this is not feasible as of writing with the current maintenance workload. Should this change, an announcement will be made on Github as well as our [Discord server](https://discord.gg/uuruzJ7).
+
+### What If I'm Willing to Contribute the Implementation?
+
+Being willing to contribute an implementation for a new database is one thing, but there's also the ongoing maintenance burden to consider.
+
+Are you willing to provide support long-term?  
+Will there be enough users that we can rely on outside contributions?  
+Or is support going to fall to the current maintainer(s)?
+
+This is the kind of thing that will need to be supported in SQLx _long_ after the initial implementation, or else later need to be removed.
+If you don't have plans for how to support a new driver long-term, then it doesn't belong as part of SQLx itself.
+
+However, drivers don't necessarily need to live _in_ SQLx anymore. Since 0.7.0, drivers don't need to be compiled-in to be functional.
+Support for third-party drivers in `sqlx-cli` and the `query!()` macros is pending, as well as documenting the process of writing a driver, but contributions are welcome in this regard.
+
+For example, see [sqlx-exasol](https://crates.io/crates/sqlx-exasol).
+
+----------------------------------------------------------------
+### Can SQLx Add Support for New Data-Type Crates (e.g. Jiff in addition to `chrono` and `time`)?
+
+This has a lot of the same considerations as adding support for new databases (see above), but with one big additional problem: Semantic Versioning.
+
+When we add trait implementations for types from an external crate, that crate then becomes part of our public API. We become beholden to its release cycle.
+
+If the crate's API is still evolving, meaning they are making breaking changes frequently, and thus releasing new major versions frequently, that then becomes a burden on us to upgrade and release a new major version as well so everyone _else_ can upgrade.
+
+We don't have the maintainer bandwidth to support multiple major versions simultaneously (we have no Long-Term Support policy), so this means that users who want to keep up-to-date are forced to make frequent manual upgrades as well.
+
+Thus, it is best that we stick to only supporting crates which have a stable API, and which are not making new major releases frequently.
+
+Conversely, adding support for SQLx _in_ these crates may not be desirable either, since SQLx is a large dependency and a higher-level crate. In this case, the SemVer problem gets pushed onto the other crate.
+
+There isn't a satisfying answer to this problem, but one option is to have an intermediate wrapper crate.
+For example, [`jiff-sqlx`](https://crates.io/crates/jiff-sqlx), which is maintained by the author of Jiff.
+API changes to SQLx are pending to make this pattern easier to use.
 
 ----------------------------------------------------------------
 ### I'm getting `HandshakeFailure` or `CorruptMessage` when trying to connect to a server over TLS using RusTLS. What gives?
@@ -349,7 +400,7 @@ so the macros can just read those instead of talking to a database.
 
 See the following:
 
-* [the docs for `query!()`](https://docs.rs/sqlx/0.5.5/sqlx/macro.query.html#offline-mode-requires-the-offline-feature)
+* [the docs for `query!()`](https://docs.rs/sqlx/latest/sqlx/macro.query.html#offline-mode)
 * [the README for `sqlx-cli`](sqlx-cli/README.md#enable-building-in-offline-mode-with-query)
 
 To keep `.sqlx` up-to-date you need to run `cargo sqlx prepare` before every commit that

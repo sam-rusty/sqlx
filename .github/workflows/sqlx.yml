@@ -5,213 +5,203 @@ on:
   push:
     branches:
       - main
-      - '*-dev'
+      - "*-dev"
+
+env:
+  MYSQL_ISOLATED_TESTS: |
+    it_can_handle_split_packets
+    rustsec_2024_0363
+  PG_ISOLATED_TESTS: |
+    test_pg_copy_chunked
+    rustsec_2024_0363
+  SQLITE_ISOLATED_TESTS: |
+    rustsec_2024_0363
 
 jobs:
   format:
     name: Format
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v2
-
-      - uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: stable
-          override: true
-
-      # this is cheaper than requesting the non-minimal profile
+      - uses: actions/checkout@v5
       - run: rustup component add rustfmt
-
-      - uses: actions-rs/cargo@v1
-        with:
-          command: fmt
-          args: --all -- --check
+      - run: cargo fmt --all -- --check
 
   check:
     name: Check
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-24.04
     strategy:
       matrix:
-        runtime: [async-std, tokio]
-        tls: [native-tls, rustls, none]
+        # Note: because `async-std` is deprecated, we only check it in a single job to save CI time.
+        runtime: [ async-global-executor, smol, tokio ]
+        tls: [ native-tls, rustls, none ]
+        include:
+          - { runtime: async-std, tls: rustls }
+          - { runtime: tokio, tls: rustls-aws-lc-rs-native-roots }
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v5
 
-      - uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: stable
-          override: true
+      # Swatinem/rust-cache recommends setting up the rust toolchain first because it's used in cache keys
+      - name: Setup Rust
+        # https://blog.rust-lang.org/2025/03/02/Rustup-1.28.0.html
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustup component add clippy
+          rustup toolchain install beta
+          rustup component add --toolchain beta clippy
 
-      - uses: Swatinem/rust-cache@v1
-        with:
-          key: ${{ runner.os }}-check-${{ matrix.runtime }}-${{ matrix.tls }}
+      - uses: Swatinem/rust-cache@v2
 
-      - uses: actions-rs/cargo@v1
-        with:
-          command: check
-          args: >
-            --manifest-path sqlx-core/Cargo.toml
-            --no-default-features
-            --features json,offline,migrate,_rt-${{ matrix.runtime }},_tls-${{ matrix.tls }}
-        env:
-          RUSTFLAGS: -D warnings
+      - run: >
+          cargo clippy
+          --no-default-features
+          --features all-databases,_unstable-all-types,sqlite-preupdate-hook,runtime-${{ matrix.runtime }},tls-${{ matrix.tls }},macros
+          -- -D warnings
 
-      - uses: actions-rs/cargo@v1
-        with:
-          command: check
-          args: >
-            --no-default-features
-            --features all-databases,_unstable-all-types,runtime-${{ matrix.runtime }},tls-${{ matrix.tls }},macros
-        env:
-          RUSTFLAGS: -D warnings
+      # Run beta for new warnings but don't break the build.
+      # Use a subdirectory of `target` to avoid clobbering the cache.
+      - run: >
+          cargo +beta clippy
+          --no-default-features
+          --features all-databases,_unstable-all-types,sqlite-preupdate-hook,runtime-${{ matrix.runtime }},tls-${{ matrix.tls }},macros
+          --target-dir target/beta/
+
+  check-minimal-versions:
+    name: Check build using direct minimal versions
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - name: Setup Rust
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustup toolchain install nightly
+      - run: cargo +nightly generate-lockfile -Z minimal-versions
+      - run: cargo build --all-features
 
   test:
-    name: Unit Test
-    runs-on: ubuntu-20.04
-    strategy:
-      matrix:
-        runtime: [async-std, tokio]
-        tls: [native-tls, rustls, none]
+    name: Unit Tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v5
 
-      - uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: stable
-          override: true
+      # https://blog.rust-lang.org/2025/03/02/Rustup-1.28.0.html
+      - name: Setup Rust
+        run: rustup show active-toolchain || rustup toolchain install
 
-      - uses: Swatinem/rust-cache@v1
-        with:
-          key: ${{ runner.os }}-test
+      - uses: Swatinem/rust-cache@v2
 
-      - uses: actions-rs/cargo@v1
-        with:
-          command: test
-          args: >
-            --manifest-path sqlx-core/Cargo.toml
-            --features json,_rt-${{ matrix.runtime }},_tls-${{ matrix.tls }}
+      - name: Test sqlx-core
+        run: >
+          cargo test
+          -p sqlx-core
+          --all-features      
 
-  cli-test:
-    name: CLI Unit Test
-    runs-on: ubuntu-20.04
-    steps:
-      - uses: actions/checkout@v2
+      - name: Test sqlx-mysql
+        run: >
+          cargo test
+          -p sqlx-mysql
+          --all-features      
 
-      - uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: stable
-          override: true
+      - name: Test sqlx-postgres
+        run: >
+          cargo test
+          -p sqlx-postgres
+          --all-features      
 
-      - uses: Swatinem/rust-cache@v1
-        with:
-          key: ${{ runner.os }}-test
+      - name: Test sqlx-sqlite
+        run: >
+          cargo test
+          -p sqlx-sqlite
+          --all-features      
 
-      - uses: actions-rs/cargo@v1
-        with:
-          command: test
-          args: >
-            --manifest-path sqlx-cli/Cargo.toml
+      - name: Test sqlx-macros-core
+        run: >
+          cargo test
+          -p sqlx-macros-core
+          --all-features
 
-  cli:
-    name: CLI Binaries
-    runs-on: ${{ matrix.os }}
-
-    strategy:
-      matrix:
-        os: [ubuntu-latest, windows-latest]#, macOS-latest]
-        include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-musl
-            args: --features openssl-vendored
-            bin: target/debug/cargo-sqlx
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            bin: target/debug/cargo-sqlx.exe
-          # FIXME: macOS build fails because of missing pin-project-internal
-#          - os: macOS-latest
-#            target: x86_64-apple-darwin
-#            bin: target/debug/cargo-sqlx
-
-    steps:
-      - uses: actions/checkout@v2
-
-      - uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: stable
-          target: ${{ matrix.target }}
-          override: true
-
-      - uses: Swatinem/rust-cache@v1
-        with:
-          key: ${{ runner.os }}-cli
-
-      - uses: actions-rs/cargo@v1
-        with:
-          command: build
-          args: --manifest-path sqlx-cli/Cargo.toml --bin cargo-sqlx ${{ matrix.args }}
-
-      - uses: actions/upload-artifact@v2
-        with:
-          name: cargo-sqlx-${{ matrix.target }}
-          path: ${{ matrix.bin }}
+      # Note: use `--lib` to not run integration tests that require a DB
+      - name: Test sqlx
+        run: >
+          cargo test
+          -p sqlx
+          --lib
+          --all-features
 
   sqlite:
     name: SQLite
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-24.04
     strategy:
       matrix:
-        runtime: [async-std, tokio]
+        runtime: [ async-global-executor, smol, tokio ]
+        linking: [ sqlite, sqlite-unbundled ]
     needs: check
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v5
 
       - run: mkdir /tmp/sqlite3-lib && wget -O /tmp/sqlite3-lib/ipaddr.so https://github.com/nalgeon/sqlean/releases/download/0.15.2/ipaddr.so
 
-      - uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: stable
-          override: true
+      # https://blog.rust-lang.org/2025/03/02/Rustup-1.28.0.html
+      - name: Setup Rust
+        run: rustup show active-toolchain || rustup toolchain install
 
-      - uses: Swatinem/rust-cache@v1
-        with:
-          key: ${{ runner.os }}-sqlite-${{ matrix.runtime }}-${{ matrix.tls }}
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install system sqlite library
+        if: ${{ matrix.linking == 'sqlite-unbundled' }}
+        run: sudo apt-get install -y libsqlite3-dev
 
       - run: echo "using ${DATABASE_URL}"
 
       # Create data dir for offline mode
       - run: mkdir .sqlx
 
-      - uses: actions-rs/cargo@v1
-        with:
-          command: test
-          args: >
-            --no-default-features
-            --features any,macros,sqlite,_unstable-all-types,runtime-${{ matrix.runtime }}
-            --
+      - run: |
+          SKIP_ARGS=()
+          for test in $SQLITE_ISOLATED_TESTS; do
+            SKIP_ARGS+=(--skip "$test")
+          done
+          cargo test \
+            --no-default-features \
+            --features any,macros,migrate,${{ matrix.linking }},_unstable-all-types,runtime-${{ matrix.runtime }},${{ matrix.linking == 'sqlite' && 'sqlite-preupdate-hook' || ''}} \
+            -- \
+            "${SKIP_ARGS[@]}" \
             --test-threads=1
         env:
           DATABASE_URL: sqlite:tests/sqlite/sqlite.db
           SQLX_OFFLINE_DIR: .sqlx
-          RUSTFLAGS: --cfg sqlite_ipaddr
+          RUSTFLAGS: --cfg sqlite_ipaddr --cfg sqlite_test_sqlcipher
+          LD_LIBRARY_PATH: /tmp/sqlite3-lib
+
+      # Run the `test-attr` test again to cover cleanup.
+      # The `sqlite-test-attr` test requires the `sqlite` feature.
+      - if: ${{ matrix.linking == 'sqlite' }}
+        run: >
+          cargo test
+          --test sqlite-test-attr
+          --no-default-features
+          --features any,macros,migrate,${{ matrix.linking }},_unstable-all-types,runtime-${{ matrix.runtime }},${{ matrix.linking == 'sqlite' && 'sqlite-preupdate-hook' || ''}}
+          --
+          --test-threads=1
+        env:
+          DATABASE_URL: sqlite:tests/sqlite/sqlite.db
+          SQLX_OFFLINE_DIR: .sqlx
+          RUSTFLAGS: --cfg sqlite_ipaddr --cfg sqlite_test_sqlcipher
           LD_LIBRARY_PATH: /tmp/sqlite3-lib
 
       # Remove test artifacts
       - run: cargo clean -p sqlx
 
       # Build the macros-test in offline mode (omit DATABASE_URL)
-      - uses: actions-rs/cargo@v1
-        with:
-          command: build
-          args: >
-            --no-default-features
-            --test sqlite-macros
-            --features any,macros,sqlite,_unstable-all-types,runtime-${{ matrix.runtime }}
+      - run: >
+          cargo build
+          --no-default-features
+          --test sqlite-macros
+          --features any,macros,${{ matrix.linking }},_unstable-all-types,runtime-${{ matrix.runtime }}
         env:
           SQLX_OFFLINE: true
           SQLX_OFFLINE_DIR: .sqlx
@@ -219,13 +209,11 @@ jobs:
           LD_LIBRARY_PATH: /tmp/sqlite3-lib
 
       # Test macros in offline mode (still needs DATABASE_URL to run)
-      - uses: actions-rs/cargo@v1
-        with:
-          command: test
-          args: >
-            --no-default-features
-            --test sqlite-macros
-            --features any,macros,sqlite,_unstable-all-types,runtime-${{ matrix.runtime }}
+      - run: >
+          cargo test
+          --no-default-features
+          --test sqlite-macros
+          --features any,macros,${{ matrix.linking }},_unstable-all-types,runtime-${{ matrix.runtime }}
         env:
           DATABASE_URL: sqlite://tests/sqlite/sqlite.db
           SQLX_OFFLINE: true
@@ -233,179 +221,352 @@ jobs:
           RUSTFLAGS: --cfg sqlite_ipaddr
           LD_LIBRARY_PATH: /tmp/sqlite3-lib
 
-  postgres:
-    name: Postgres
-    runs-on: ubuntu-20.04
-    strategy:
-      matrix:
-        postgres: [15, 11]
-        runtime: [async-std, tokio]
-        tls: [native-tls, rustls, none]
+  sqlite-isolated:
+    name: SQLite Isolated
+    runs-on: ubuntu-24.04
     needs: check
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v5
 
-      - uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: stable
-          override: true
+      - run: mkdir /tmp/sqlite3-lib && wget -O /tmp/sqlite3-lib/ipaddr.so https://github.com/nalgeon/sqlean/releases/download/0.15.2/ipaddr.so
 
-      - uses: Swatinem/rust-cache@v1
-        with:
-          key: ${{ runner.os }}-postgres-${{ matrix.runtime }}-${{ matrix.tls }}
+      # https://blog.rust-lang.org/2025/03/02/Rustup-1.28.0.html
+      - name: Setup Rust
+        run: rustup show active-toolchain || rustup toolchain install
 
-      - uses: actions-rs/cargo@v1
-        env:
-          # FIXME: needed to disable `ltree` tests in Postgres 9.6
-          # but `PgLTree` should just fall back to text format
-          RUSTFLAGS: -D warnings --cfg postgres_${{ matrix.postgres }}
-        with:
-          command: build
-          args: >
-            --features postgres,_unstable-all-types,runtime-${{ matrix.runtime }},tls-${{ matrix.tls }}
+      - uses: Swatinem/rust-cache@v2
 
       - run: |
-          docker-compose -f tests/docker-compose.yml run -d -p 5432:5432 --name postgres_${{ matrix.postgres }} postgres_${{ matrix.postgres }}
+          for test in $SQLITE_ISOLATED_TESTS; do
+            cargo test \
+              --no-default-features \
+              --features sqlite,macros,runtime-tokio \
+              --test sqlite-rustsec \
+              -- \
+              --exact "$test" \
+              --test-threads=1
+          done
+        env:
+          DATABASE_URL: sqlite:tests/sqlite/sqlite.db
+          RUSTFLAGS: --cfg sqlite_ipaddr --cfg sqlite_test_sqlcipher
+          LD_LIBRARY_PATH: /tmp/sqlite3-lib
+
+  postgres:
+    name: Postgres
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        postgres: [ 17, 13 ]
+        runtime: [ async-global-executor, smol, tokio ]
+        tls: [ native-tls, rustls-aws-lc-rs, rustls-ring, none ]
+    needs: check
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Setup Rust
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+
+      - env:
+          RUSTFLAGS: -D warnings --cfg postgres="${{ matrix.postgres }}"
+        run: >
+          cargo build 
+          --no-default-features
+          --features postgres,_unstable-all-types,runtime-${{ matrix.runtime }},tls-${{ matrix.tls }},macros,migrate
+
+      # Generate TLS certificates
+      - run: ./gen-certs.sh
+        working-directory: tests/certs
+
+      - run: |
+          docker compose -f tests/docker-compose.yml run -d -p 5432:5432 --name postgres_${{ matrix.postgres }} postgres_${{ matrix.postgres }}
+
+      - run: |
           docker exec postgres_${{ matrix.postgres }} bash -c "until pg_isready; do sleep 1; done"
 
       # Create data dir for offline mode
       - run: mkdir .sqlx
 
-      - uses: actions-rs/cargo@v1
-        with:
-          command: test
-          args: >
-            --no-default-features
-            --features any,postgres,macros,_unstable-all-types,runtime-${{ matrix.runtime }},tls-${{ matrix.tls }}
+      - run: |
+          SKIP_ARGS=()
+          for test in $PG_ISOLATED_TESTS; do
+            SKIP_ARGS+=(--skip "$test")
+          done
+          cargo test \
+            --no-default-features \
+            --features any,postgres,macros,migrate,_unstable-all-types,runtime-${{ matrix.runtime }},tls-${{ matrix.tls }} \
+            -- \
+            "${SKIP_ARGS[@]}"
         env:
           DATABASE_URL: postgres://postgres:password@localhost:5432/sqlx
           SQLX_OFFLINE_DIR: .sqlx
-          # FIXME: needed to disable `ltree` tests in Postgres 9.6
-          # but `PgLTree` should just fall back to text format
-          RUSTFLAGS: --cfg postgres_${{ matrix.postgres }}
+          RUSTFLAGS: -D warnings --cfg postgres="${{ matrix.postgres }}"
 
-      - uses: actions-rs/cargo@v1
-        if: matrix.tls != 'none'
-        with:
-          command: test
-          args: >
-            --no-default-features
-            --features any,postgres,macros,_unstable-all-types,runtime-${{ matrix.runtime }},tls-${{ matrix.tls }}
+      # Run tests again with implied linux user
+      - run: |
+          SKIP_ARGS=()
+          for test in $PG_ISOLATED_TESTS; do
+            SKIP_ARGS+=(--skip "$test")
+          done
+          cargo test \
+            --no-default-features \
+            --features any,postgres,macros,migrate,_unstable-all-types,runtime-${{ matrix.runtime }},tls-${{ matrix.tls }} \
+            -- \
+            "${SKIP_ARGS[@]}"
+        env:
+          DATABASE_URL: postgres:///sqlx?password=runner-password
+          SQLX_OFFLINE_DIR: .sqlx
+          RUSTFLAGS: -D warnings --cfg postgres="${{ matrix.postgres }}"
+
+      # Run the `test-attr` test again to cover cleanup.
+      - run: >
+          cargo test
+          --test postgres-test-attr
+          --no-default-features
+          --features any,postgres,macros,migrate,_unstable-all-types,runtime-${{ matrix.runtime }},tls-${{ matrix.tls }}
+        env:
+          DATABASE_URL: postgres://postgres:password@localhost:5432/sqlx
+          SQLX_OFFLINE_DIR: .sqlx
+          RUSTFLAGS: -D warnings --cfg postgres="${{ matrix.postgres }}"
+
+      - if: matrix.tls != 'none'
+        run: |
+          SKIP_ARGS=()
+          for test in $PG_ISOLATED_TESTS; do
+            SKIP_ARGS+=(--skip "$test")
+          done
+          cargo test \
+            --no-default-features \
+            --features any,postgres,macros,migrate,_unstable-all-types,runtime-${{ matrix.runtime }},tls-${{ matrix.tls }} \
+            -- \
+            "${SKIP_ARGS[@]}"
         env:
           DATABASE_URL: postgres://postgres:password@localhost:5432/sqlx?sslmode=verify-ca&sslrootcert=.%2Ftests%2Fcerts%2Fca.crt
           SQLX_OFFLINE_DIR: .sqlx
-          # FIXME: needed to disable `ltree` tests in Postgres 9.6
-          # but `PgLTree` should just fall back to text format
-          RUSTFLAGS: --cfg postgres_${{ matrix.postgres }}
+          RUSTFLAGS: -D warnings --cfg postgres="${{ matrix.postgres }}"
 
       # Remove test artifacts
       - run: cargo clean -p sqlx
 
       # Build the macros-test in offline mode (omit DATABASE_URL)
-      - uses: actions-rs/cargo@v1
-        with:
-          command: build
-          args: >
-            --no-default-features
-            --test postgres-macros
-            --features any,postgres,macros,_unstable-all-types,runtime-${{ matrix.runtime }},tls-${{ matrix.tls }}
+      - run: >
+          cargo build
+          --no-default-features
+          --test postgres-macros
+          --features any,postgres,macros,_unstable-all-types,runtime-${{ matrix.runtime }},tls-${{ matrix.tls }}
         env:
           SQLX_OFFLINE: true
           SQLX_OFFLINE_DIR: .sqlx
-          # FIXME: needed to disable `ltree` tests in Postgres 9.6
-          # but `PgLTree` should just fall back to text format
-          RUSTFLAGS: -D warnings --cfg postgres_${{ matrix.postgres }}
+          RUSTFLAGS: -D warnings --cfg postgres="${{ matrix.postgres }}"
 
       # Test macros in offline mode (still needs DATABASE_URL to run)
-      - uses: actions-rs/cargo@v1
-        with:
-          command: test
-          args: >
-            --no-default-features
-            --test postgres-macros
-            --features any,postgres,macros,_unstable-all-types,runtime-${{ matrix.runtime }},tls-${{ matrix.tls }}
+      - run: >
+          cargo test
+          --no-default-features
+          --test postgres-macros
+          --features any,postgres,macros,_unstable-all-types,runtime-${{ matrix.runtime }},tls-${{ matrix.tls }}
         env:
           DATABASE_URL: postgres://postgres:password@localhost:5432/sqlx
           SQLX_OFFLINE: true
           SQLX_OFFLINE_DIR: .sqlx
-          # FIXME: needed to disable `ltree` tests in Postgres 9.6
-          # but `PgLTree` should just fall back to text format
-          RUSTFLAGS: --cfg postgres_${{ matrix.postgres }}
+          RUSTFLAGS: -D warnings --cfg postgres="${{ matrix.postgres }}"
 
-      # client SSL authentication
+  postgres-ssl-auth:
+    name: Postgres SSL Auth
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        postgres: [ 13, 17 ]
+        runtime: [ async-std, tokio ]
+        tls: [ native-tls, rustls-aws-lc-rs, rustls-ring ]
+        include:
+          - { postgres: 17, runtime: tokio, tls: rustls-aws-lc-rs-native-roots }
+    needs: check
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Setup Rust
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Generate TLS certificates
+      - run: ./gen-certs.sh
+        working-directory: tests/certs
 
       - run: |
-          docker stop postgres_${{ matrix.postgres }}
-          docker-compose -f tests/docker-compose.yml run -d -p 5432:5432 --name postgres_${{ matrix.postgres }}_client_ssl postgres_${{ matrix.postgres }}_client_ssl
+          docker compose -f tests/docker-compose.yml run -d -p 5432:5432 --name postgres_${{ matrix.postgres }}_client_ssl postgres_${{ matrix.postgres }}_client_ssl
+
+      - run: |
           docker exec postgres_${{ matrix.postgres }}_client_ssl bash -c "until pg_isready; do sleep 1; done"
 
-      - uses: actions-rs/cargo@v1
-        if: matrix.tls != 'none'
-        with:
-          command: test
-          args: >
-            --no-default-features
-            --features any,postgres,macros,_unstable-all-types,runtime-${{ matrix.runtime }},tls-${{ matrix.tls }}
+      - run: |
+          SKIP_ARGS=()
+          for test in $PG_ISOLATED_TESTS; do
+            SKIP_ARGS+=(--skip "$test")
+          done
+          cargo test \
+            --no-default-features \
+            --features any,postgres,macros,_unstable-all-types,runtime-${{ matrix.runtime }},tls-${{ matrix.tls }} \
+            -- \
+            "${SKIP_ARGS[@]}"
         env:
-          DATABASE_URL: postgres://postgres@localhost:5432/sqlx?sslmode=verify-ca&sslrootcert=.%2Ftests%2Fcerts%2Fca.crt&sslkey=.%2Ftests%2Fkeys%2Fclient.key&sslcert=.%2Ftests%2Fcerts%2Fclient.crt
-          # FIXME: needed to disable `ltree` tests in Postgres 9.6
-          # but `PgLTree` should just fall back to text format
-          RUSTFLAGS: --cfg postgres_${{ matrix.postgres }}_client_ssl
+          DATABASE_URL: postgres://postgres@localhost:5432/sqlx?sslmode=verify-ca&sslrootcert=.%2Ftests%2Fcerts%2Fca.crt&sslkey=.%2Ftests%2Fcerts%2Fkeys%2Fclient.key&sslcert=.%2Ftests%2Fcerts%2Fclient.crt
+          RUSTFLAGS: -D warnings --cfg postgres="${{ matrix.postgres }}"
+
+      # Test with `hostaddr` and `verify-full` (test connection only)
+      - run: |
+          SKIP_ARGS=()
+          for test in $PG_ISOLATED_TESTS; do
+            SKIP_ARGS+=(--skip "$test")
+          done
+          cargo test \
+            --no-default-features \
+            --features any,postgres,macros,_unstable-all-types,runtime-${{ matrix.runtime }},tls-${{ matrix.tls }} \
+            --test postgres \
+            -- --exact it_connects
+        env:
+          DATABASE_URL: postgres://postgres@sqlx.test:5432/sqlx?hostaddr=127.0.0.1&sslmode=verify-full&sslrootcert=.%2Ftests%2Fcerts%2Fca.crt&sslkey=.%2Ftests%2Fcerts%2Fkeys%2Fclient.key&sslcert=.%2Ftests%2Fcerts%2Fclient.crt
+          RUSTFLAGS: -D warnings --cfg postgres="${{ matrix.postgres }}"
+
+      # Test with IPv6 and `verify-full` (test connection only)
+      # The generated certificate includes a `subjectAltName` with an IPv6-mapped `127.0.0.1`
+      - run: |
+          cargo test \
+            --no-default-features \
+            --features any,postgres,macros,_unstable-all-types,runtime-${{ matrix.runtime }},tls-${{ matrix.tls }} \
+            --test postgres \
+            -- --exact it_connects
+        env:
+          DATABASE_URL: postgres://postgres@[::ffff:127.0.0.1]:5432/sqlx?sslmode=verify-full&sslrootcert=.%2Ftests%2Fcerts%2Fca.crt&sslkey=.%2Ftests%2Fcerts%2Fkeys%2Fclient.key&sslcert=.%2Ftests%2Fcerts%2Fclient.crt
+          RUSTFLAGS: -D warnings --cfg postgres="${{ matrix.postgres }}"
+
+  postgres-isolated:
+    name: Postgres Isolated
+    runs-on: ubuntu-24.04
+    needs: check
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Setup Rust
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Generate TLS certificates
+      - run: ./gen-certs.sh
+        working-directory: tests/certs
+
+      - run: |
+          docker compose -f tests/docker-compose.yml run -d -p 5432:5432 --name postgres_17 postgres_17
+          docker exec postgres_17 bash -c "until pg_isready; do sleep 1; done"
+
+      # Run isolated Postgres tests to avoid stalling the main job.
+      - run: |
+          for test in $PG_ISOLATED_TESTS; do
+            cargo test \
+              --no-default-features \
+              --features any,postgres,macros,_unstable-all-types,runtime-tokio,tls-none \
+              --test postgres \
+              -- \
+              --exact "$test" \
+              --test-threads=1
+          done
+        env:
+          DATABASE_URL: postgres://postgres:password@localhost:5432/sqlx
+          RUSTFLAGS: -D warnings --cfg postgres="17"
 
   mysql:
     name: MySQL
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-24.04
     strategy:
       matrix:
-        mysql: [8, 5_7]
-        runtime: [async-std, tokio]
-        tls: [native-tls, rustls, none]
+        mysql: [ 8 ]
+        runtime: [ async-global-executor, smol, tokio ]
+        tls: [ native-tls, rustls-aws-lc-rs, rustls-ring, none ]
     needs: check
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v5
 
-      - uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: stable
-          override: true
+      - name: Setup Rust
+        run: rustup show active-toolchain || rustup toolchain install
 
-      - uses: Swatinem/rust-cache@v1
-        with:
-          key: ${{ runner.os }}-mysql-${{ matrix.runtime }}-${{ matrix.tls }}
+      - uses: Swatinem/rust-cache@v2
 
-      - uses: actions-rs/cargo@v1
-        with:
-          command: build
-          args: >
-            --features mysql,_unstable-all-types,runtime-${{ matrix.runtime }},tls-${{ matrix.tls }}
+      - run: cargo build --features mysql,_unstable-all-types,runtime-${{ matrix.runtime }},tls-${{ matrix.tls }}
 
-      - run: docker-compose -f tests/docker-compose.yml run -d -p 3306:3306 --name mysql_${{ matrix.mysql }} mysql_${{ matrix.mysql }}
-      - run: sleep 60
+      # Generate TLS certificates
+      - run: ./gen-certs.sh
+        working-directory: tests/certs
+
+      - run: docker compose -f tests/docker-compose.yml run -d -p 3306:3306 --name mysql_${{ matrix.mysql }} mysql_${{ matrix.mysql }}
+      - name: Wait for MySQL
+        run: |
+          docker exec mysql_${{ matrix.mysql }} bash -c '
+            until (command -v mysqladmin >/dev/null && mysqladmin ping -uroot -ppassword --silent) || \
+                  (command -v mariadb-admin >/dev/null && mariadb-admin ping -uroot -ppassword --silent); do
+              sleep 2
+            done
+          '
 
       # Create data dir for offline mode
       - run: mkdir .sqlx
 
-      - uses: actions-rs/cargo@v1
-        with:
-          command: test
-          args: >
-            --no-default-features
-            --features any,mysql,macros,_unstable-all-types,runtime-${{ matrix.runtime }},tls-${{ matrix.tls }}
+      - run: |
+          SKIP_ARGS=()
+          for test in $MYSQL_ISOLATED_TESTS; do
+            SKIP_ARGS+=(--skip "$test")
+          done
+          cargo test \
+            --no-default-features \
+            --features any,mysql,mysql-rsa,macros,migrate,_unstable-all-types,runtime-${{ matrix.runtime }},tls-${{ matrix.tls }} \
+            -- \
+            "${SKIP_ARGS[@]}"
+        env:
+          DATABASE_URL: mysql://root:password@localhost:3306/sqlx?ssl-mode=disabled
+          SQLX_OFFLINE_DIR: .sqlx
+          RUSTFLAGS: --cfg mysql_${{ matrix.mysql }}
+
+      # Run the `test-attr` test again to cover cleanup.
+      - run: >
+          cargo test
+          --test mysql-test-attr
+          --no-default-features
+          --features any,mysql,mysql-rsa,macros,migrate,_unstable-all-types,runtime-${{ matrix.runtime }},tls-${{ matrix.tls }}
         env:
           DATABASE_URL: mysql://root:password@localhost:3306/sqlx?ssl-mode=disabled
           SQLX_OFFLINE_DIR: .sqlx
           RUSTFLAGS: --cfg mysql_${{ matrix.mysql }}
 
       # MySQL 5.7 supports TLS but not TLSv1.3 as required by RusTLS.
-      - uses: actions-rs/cargo@v1
-        if: ${{ !(matrix.mysql == '5_7' && matrix.tls == 'rustls') }}
-        with:
-          command: test
-          args: >
-            --no-default-features
-            --features any,mysql,macros,_unstable-all-types,runtime-${{ matrix.runtime }},tls-${{ matrix.tls }}
+      - if: ${{ !(matrix.mysql == '5_7' && matrix.tls == 'rustls') }}
+        run: |
+          SKIP_ARGS=()
+          for test in $MYSQL_ISOLATED_TESTS; do
+            SKIP_ARGS+=(--skip "$test")
+          done
+          cargo test \
+            --no-default-features \
+            --features any,mysql,${{ matrix.tls == 'none' && 'mysql-rsa,' || '' }}macros,migrate,_unstable-all-types,runtime-${{ matrix.runtime }},tls-${{ matrix.tls }} \
+            -- \
+            "${SKIP_ARGS[@]}"
+        env:
+          DATABASE_URL: mysql://root:password@localhost:3306/sqlx
+          SQLX_OFFLINE_DIR: .sqlx
+          RUSTFLAGS: --cfg mysql_${{ matrix.mysql }}
+
+      # Minimal coverage for mysql-rsa with TLS enabled; RSA should be inert when TLS is used.
+      - if: ${{ matrix.mysql == '8' && matrix.runtime == 'tokio' && matrix.tls == 'native-tls' }}
+        run: >
+          cargo test
+          --no-default-features
+          --features any,mysql,mysql-rsa,macros,migrate,_unstable-all-types,runtime-${{ matrix.runtime }},tls-${{ matrix.tls }}
         env:
           DATABASE_URL: mysql://root:password@localhost:3306/sqlx
           SQLX_OFFLINE_DIR: .sqlx
@@ -415,13 +576,11 @@ jobs:
       - run: cargo clean -p sqlx
 
       # Build the macros-test in offline mode (omit DATABASE_URL)
-      - uses: actions-rs/cargo@v1
-        with:
-          command: build
-          args: >
-            --no-default-features
-            --test mysql-macros
-            --features any,mysql,macros,_unstable-all-types,runtime-${{ matrix.runtime }},tls-${{ matrix.tls }}
+      - run: >
+          cargo build
+          --no-default-features
+          --test mysql-macros
+          --features any,mysql,macros,migrate,_unstable-all-types,runtime-${{ matrix.runtime }},tls-${{ matrix.tls }}
         env:
           SQLX_OFFLINE: true
           SQLX_OFFLINE_DIR: .sqlx
@@ -429,128 +588,304 @@ jobs:
 
       # Test macros in offline mode (still needs DATABASE_URL to run)
       # MySQL 5.7 supports TLS but not TLSv1.3 as required by RusTLS.
-      - uses: actions-rs/cargo@v1
-        if: ${{ !(matrix.mysql == '5_7' && matrix.tls == 'rustls') }}
-        with:
-          command: test
-          args: >
-            --no-default-features
-            --test mysql-macros
-            --features any,mysql,macros,_unstable-all-types,runtime-${{ matrix.runtime }},tls-${{ matrix.tls }}
+      - run: >
+          cargo test
+          --no-default-features
+          --test mysql-macros
+          --features any,mysql,${{ matrix.tls == 'none' && 'mysql-rsa,' || '' }}macros,migrate,_unstable-all-types,runtime-${{ matrix.runtime }},tls-${{ matrix.tls }}
         env:
           DATABASE_URL: mysql://root:password@localhost:3306/sqlx
           SQLX_OFFLINE: true
           SQLX_OFFLINE_DIR: .sqlx
           RUSTFLAGS: --cfg mysql_${{ matrix.mysql }}
 
-      # client SSL authentication
+  # client SSL authentication
+  mysql-ssl-auth:
+    name: MySQL SSL Auth
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        mysql: [ 8 ]
+        runtime: [ async-global-executor, smol, tokio ]
+        tls: [ native-tls, rustls-aws-lc-rs, rustls-ring ]
+        include:
+          - { mysql: 8, runtime: tokio, tls: rustls-aws-lc-rs-native-roots }
+    needs: check
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Setup Rust
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Generate TLS certificates
+      - run: ./gen-certs.sh
+        working-directory: tests/certs
 
       - run: |
-          docker stop mysql_${{ matrix.mysql }}
-          docker-compose -f tests/docker-compose.yml run -d -p 3306:3306 --name mysql_${{ matrix.mysql }}_client_ssl mysql_${{ matrix.mysql }}_client_ssl
-          sleep 60
+          docker compose -f tests/docker-compose.yml run -d -p 3306:3306 --name mysql_${{ matrix.mysql }}_client_ssl mysql_${{ matrix.mysql }}_client_ssl
+          docker exec mysql_${{ matrix.mysql }}_client_ssl bash -c '
+            until (command -v mysqladmin >/dev/null && mysqladmin ping -uroot --silent) || \
+                (command -v mariadb-admin >/dev/null && mariadb-admin ping -uroot --silent); do
+              sleep 2
+          done
+          '
 
-      # MySQL 5.7 supports TLS but not TLSv1.3 as required by RusTLS.
-      - uses: actions-rs/cargo@v1
-        if: ${{ !(matrix.mysql == '5_7' && matrix.tls == 'rustls') && matrix.tls != 'none' }}
-        with:
-          command: test
-          args: >
-            --no-default-features
-            --features any,mysql,macros,_unstable-all-types,runtime-${{ matrix.runtime }},tls-${{ matrix.tls }}
+      - run: |
+          SKIP_ARGS=()
+          for test in $MYSQL_ISOLATED_TESTS; do
+            SKIP_ARGS+=(--skip "$test")
+          done
+          cargo test \
+            --no-default-features \
+            --features any,mysql,macros,migrate,_unstable-all-types,runtime-${{ matrix.runtime }},tls-${{ matrix.tls }} \
+            -- \
+            "${SKIP_ARGS[@]}"
         env:
-          DATABASE_URL: mysql://root@localhost:3306/sqlx?sslmode=verify_ca&ssl-ca=.%2Ftests%2Fcerts%2Fca.crt&ssl-key=.%2Ftests%2Fkeys%2Fclient.key&ssl-cert=.%2Ftests%2Fcerts%2Fclient.crt
+          DATABASE_URL: mysql://root@localhost:3306/sqlx?sslmode=verify_ca&ssl-ca=.%2Ftests%2Fcerts%2Fca.crt&ssl-key=.%2Ftests%2Fcerts%2Fkeys%2Fclient.key&ssl-cert=.%2Ftests%2Fcerts%2Fclient.crt
           RUSTFLAGS: --cfg mysql_${{ matrix.mysql }}
+
+      # Test with `tls-sni-servername=sqlx.test` and `sslmode=verify_identity` (test connection only)
+      - run: |
+          SKIP_ARGS=()
+          for test in $MYSQL_ISOLATED_TESTS; do
+            SKIP_ARGS+=(--skip "$test")
+          done
+          cargo test \
+            --no-default-features \
+            --features any,mysql,macros,migrate,_unstable-all-types,runtime-${{ matrix.runtime }},tls-${{ matrix.tls }} \
+            --test mysql \
+            -- --exact it_connects
+        env:
+          DATABASE_URL: mysql://root@localhost:3306/sqlx?tls-sni-servername=sqlx.test&sslmode=verify_identity&ssl-ca=.%2Ftests%2Fcerts%2Fca.crt&ssl-key=.%2Ftests%2Fcerts%2Fkeys%2Fclient.key&ssl-cert=.%2Ftests%2Fcerts%2Fclient.crt
+          RUSTFLAGS: --cfg mysql_${{ matrix.mysql }}
+
+      # Test with IPv6 and `sslmode=verify_identity` (test connection only)
+      # The generated certificate includes a `subjectAltName` with an IPv6-mapped `127.0.0.1`
+      - run: |
+          SKIP_ARGS=()
+          for test in $MYSQL_ISOLATED_TESTS; do
+            SKIP_ARGS+=(--skip "$test")
+          done
+          cargo test \
+            --no-default-features \
+            --features any,mysql,macros,migrate,_unstable-all-types,runtime-${{ matrix.runtime }},tls-${{ matrix.tls }} \
+            --test mysql \
+            -- --exact it_connects
+        env:
+          DATABASE_URL: mysql://root@[::ffff:127.0.0.1]:3306/sqlx?sslmode=verify_identity&ssl-ca=.%2Ftests%2Fcerts%2Fca.crt&ssl-key=.%2Ftests%2Fcerts%2Fkeys%2Fclient.key&ssl-cert=.%2Ftests%2Fcerts%2Fclient.crt
+          RUSTFLAGS: --cfg mysql_${{ matrix.mysql }}
+
+  mysql-isolated:
+    name: MySQL Isolated
+    runs-on: ubuntu-24.04
+    needs: check
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Setup Rust
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Generate TLS certificates
+      - run: ./gen-certs.sh
+        working-directory: tests/certs
+
+      - run: docker compose -f tests/docker-compose.yml run -d -p 3306:3306 --name mysql_8 mysql_8
+      - name: Wait for MySQL
+        run: |
+          docker exec mysql_8 bash -c '
+            until (command -v mysqladmin >/dev/null && mysqladmin ping -uroot -ppassword --silent) || \
+                  (command -v mariadb-admin >/dev/null && mariadb-admin ping -uroot -ppassword --silent); do
+              sleep 2
+            done
+          '
+
+      # Run isolated MySQL tests to avoid stalling the main job.
+      - run: |
+          for test in $MYSQL_ISOLATED_TESTS; do
+            cargo test \
+              --no-default-features \
+              --features any,mysql,mysql-rsa,macros,migrate,_unstable-all-types,runtime-tokio,tls-none \
+              --test mysql \
+              -- \
+              --exact "$test" \
+              --test-threads=1
+          done
+        env:
+          DATABASE_URL: mysql://root:password@localhost:3306/sqlx?ssl-mode=disabled
+          RUSTFLAGS: --cfg mysql_8
 
   mariadb:
     name: MariaDB
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-24.04
     strategy:
       matrix:
-        mariadb: [verylatest, 10_11, 10_4]
-        runtime: [async-std, tokio]
-        tls: [native-tls, rustls, none]
+        mariadb: [ verylatest, 11_8, 11_4, 10_11, 10_6 ]
+        runtime: [ async-global-executor, smol, tokio ]
+        tls: [ native-tls, rustls-aws-lc-rs, rustls-ring, none ]
     needs: check
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v5
 
-      - uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: stable
-          override: true
+      - name: Setup Rust
+        run: rustup show active-toolchain || rustup toolchain install
 
-      - uses: Swatinem/rust-cache@v1
-        with:
-          key: ${{ runner.os }}-mysql-${{ matrix.runtime }}-${{ matrix.tls }}
+      - uses: Swatinem/rust-cache@v2
 
-      - uses: actions-rs/cargo@v1
-        with:
-          command: build
-          args: >
-            --features mysql,_unstable-all-types,runtime-${{ matrix.runtime }},tls-${{ matrix.tls }}
+      - run: cargo build --features mysql,_unstable-all-types,runtime-${{ matrix.runtime }},tls-${{ matrix.tls }}
 
-      - run: docker-compose -f tests/docker-compose.yml run -d -p 3306:3306 --name mariadb_${{ matrix.mariadb }} mariadb_${{ matrix.mariadb }}
-      - run: sleep 30
+      # Generate TLS certificates
+      - run: ./gen-certs.sh
+        working-directory: tests/certs
+
+      - run: docker compose -f tests/docker-compose.yml run -d -p 3306:3306 --name mariadb_${{ matrix.mariadb }} mariadb_${{ matrix.mariadb }}
+      - name: Wait for MariaDB
+        run: |
+          docker exec mariadb_${{ matrix.mariadb }} bash -c '
+            until (command -v mysqladmin >/dev/null && mysqladmin ping -uroot -ppassword --silent) || \
+                  (command -v mariadb-admin >/dev/null && mariadb-admin ping -uroot -ppassword --silent); do
+              sleep 2
+            done
+          '
 
       # Create data dir for offline mode
       - run: mkdir .sqlx
 
-      - uses: actions-rs/cargo@v1
-        with:
-          command: test
-          args: >
-            --no-default-features
-            --features any,mysql,macros,_unstable-all-types,runtime-${{ matrix.runtime }},tls-${{ matrix.tls }}
+      - run: |
+          SKIP_ARGS=()
+          for test in $MYSQL_ISOLATED_TESTS; do
+            SKIP_ARGS+=(--skip "$test")
+          done
+          cargo test \
+            --no-default-features \
+            --features any,mysql,macros,migrate,_unstable-all-types,runtime-${{ matrix.runtime }},tls-${{ matrix.tls }} \
+            -- \
+            "${SKIP_ARGS[@]}"
         env:
           DATABASE_URL: mysql://root:password@localhost:3306/sqlx
           SQLX_OFFLINE_DIR: .sqlx
-          RUSTFLAGS: --cfg mariadb_${{ matrix.mariadb }}
+          RUSTFLAGS: --cfg mariadb="${{ matrix.mariadb }}"
+
+      # Run the `test-attr` test again to cover cleanup.
+      - run: >
+          cargo test
+          --test mysql-test-attr
+          --no-default-features
+          --features any,mysql,macros,migrate,_unstable-all-types,runtime-${{ matrix.runtime }},tls-${{ matrix.tls }}
+        env:
+          DATABASE_URL: mysql://root:password@localhost:3306/sqlx
+          SQLX_OFFLINE_DIR: .sqlx
+          RUSTFLAGS: --cfg mariadb="${{ matrix.mariadb }}"
 
       # Remove test artifacts
       - run: cargo clean -p sqlx
 
       # Build the macros-test in offline mode (omit DATABASE_URL)
-      - uses: actions-rs/cargo@v1
-        with:
-          command: build
-          args: >
-            --no-default-features
-            --test mysql-macros
-            --features any,mysql,macros,_unstable-all-types,runtime-${{ matrix.runtime }},tls-${{ matrix.tls }}
+      - run: >
+          cargo build
+          --no-default-features
+          --test mysql-macros
+          --features any,mysql,macros,migrate,_unstable-all-types,runtime-${{ matrix.runtime }},tls-${{ matrix.tls }}
         env:
           SQLX_OFFLINE: true
           SQLX_OFFLINE_DIR: .sqlx
-          RUSTFLAGS: -D warnings --cfg mariadb_${{ matrix.mariadb }}
+          RUSTFLAGS: -D warnings --cfg mariadb="${{ matrix.mariadb }}"
 
       # Test macros in offline mode (still needs DATABASE_URL to run)
-      - uses: actions-rs/cargo@v1
-        with:
-          command: test
-          args: >
-            --no-default-features
-            --test mysql-macros
-            --features any,mysql,macros,_unstable-all-types,runtime-${{ matrix.runtime }},tls-${{ matrix.tls }}
+      - run: >
+          cargo test
+          --no-default-features
+          --test mysql-macros
+          --features any,mysql,macros,migrate,_unstable-all-types,runtime-${{ matrix.runtime }},tls-${{ matrix.tls }}
         env:
           DATABASE_URL: mysql://root:password@localhost:3306/sqlx
           SQLX_OFFLINE: true
           SQLX_OFFLINE_DIR: .sqlx
-          RUSTFLAGS: --cfg mariadb_${{ matrix.mariadb }}
+          RUSTFLAGS: --cfg mariadb="${{ matrix.mariadb }}"
 
-      # client SSL authentication
+  # client SSL authentication
+  mariadb-ssl-auth:
+    name: MariaDB SSL Auth
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        mariadb: [ verylatest, 11_8, 11_4, 10_11, 10_6 ]
+        runtime: [ async-global-executor, smol, tokio ]
+        tls: [ native-tls, rustls-aws-lc-rs, rustls-ring ]
+        include:
+          - { mariadb: verylatest, runtime: tokio, tls: rustls-aws-lc-rs-native-roots }
+    needs: check
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Setup Rust
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo build --features mysql,_unstable-all-types,runtime-${{ matrix.runtime }},tls-${{ matrix.tls }}
+
+      # Generate TLS certificates
+      - run: ./gen-certs.sh
+        working-directory: tests/certs
 
       - run: |
-          docker stop mariadb_${{ matrix.mariadb }}
-          docker-compose -f tests/docker-compose.yml run -d -p 3306:3306 --name mariadb_${{ matrix.mariadb }}_client_ssl mariadb_${{ matrix.mariadb }}_client_ssl
-          sleep 60
+          docker compose -f tests/docker-compose.yml run -d -p 3306:3306 --name mariadb_${{ matrix.mariadb }}_client_ssl mariadb_${{ matrix.mariadb }}_client_ssl
+          docker exec mariadb_${{ matrix.mariadb }}_client_ssl bash -c '
+            until (command -v mysqladmin >/dev/null && mysqladmin ping -uroot --silent) || \
+                  (command -v mariadb-admin >/dev/null && mariadb-admin ping -uroot --silent); do
+              sleep 2
+            done
+          '
 
-      - uses: actions-rs/cargo@v1
-        if: matrix.tls != 'none'
-        with:
-          command: test
-          args: >
-            --no-default-features
-            --features any,mysql,macros,_unstable-all-types,runtime-${{ matrix.runtime }},tls-${{ matrix.tls }}
+      - run: |
+          SKIP_ARGS=()
+          for test in $MYSQL_ISOLATED_TESTS; do
+            SKIP_ARGS+=(--skip "$test")
+          done
+          cargo test \
+            --no-default-features \
+            --features any,mysql,macros,migrate,_unstable-all-types,runtime-${{ matrix.runtime }},tls-${{ matrix.tls }} \
+            -- \
+            "${SKIP_ARGS[@]}"
         env:
-          DATABASE_URL: mysql://root@localhost:3306/sqlx?sslmode=verify_ca&ssl-ca=.%2Ftests%2Fcerts%2Fca.crt&ssl-key=.%2Ftests%2Fkeys%2Fclient.key&ssl-cert=.%2Ftests%2Fcerts%2Fclient.crt
-          RUSTFLAGS: --cfg mariadb_${{ matrix.mariadb }}
+          DATABASE_URL: mysql://root@localhost:3306/sqlx?sslmode=verify_ca&ssl-ca=.%2Ftests%2Fcerts%2Fca.crt&ssl-key=.%2Ftests%2Fcerts%2Fkeys%2Fclient.key&ssl-cert=.%2Ftests%2Fcerts%2Fclient.crt
+          RUSTFLAGS: --cfg mariadb="${{ matrix.mariadb }}"
+
+      # Test with `tls-sni-servername=sqlx.test` and `sslmode=verify_identity` (test connection only)
+      - run: |
+          SKIP_ARGS=()
+          for test in $MYSQL_ISOLATED_TESTS; do
+            SKIP_ARGS+=(--skip "$test")
+          done
+          cargo test \
+            --no-default-features \
+            --features any,mysql,macros,migrate,_unstable-all-types,runtime-${{ matrix.runtime }},tls-${{ matrix.tls }} \
+            --test mysql \
+            -- --exact it_connects
+        env:
+          DATABASE_URL: mysql://root@localhost:3306/sqlx?tls-sni-servername=sqlx.test&sslmode=verify_identity&ssl-ca=.%2Ftests%2Fcerts%2Fca.crt&ssl-key=.%2Ftests%2Fcerts%2Fkeys%2Fclient.key&ssl-cert=.%2Ftests%2Fcerts%2Fclient.crt
+          RUSTFLAGS: --cfg mariadb="${{ matrix.mariadb }}"
+
+      # Test with IPv6 and `sslmode=verify_identity` (test connection only)
+      # The generated certificate includes a `subjectAltName` with an IPv6-mapped `127.0.0.1`
+      - run: |
+          SKIP_ARGS=()
+          for test in $MYSQL_ISOLATED_TESTS; do
+            SKIP_ARGS+=(--skip "$test")
+          done
+          cargo test \
+            --no-default-features \
+            --features any,mysql,macros,migrate,_unstable-all-types,runtime-${{ matrix.runtime }},tls-${{ matrix.tls }} \
+            --test mysql \
+            -- --exact it_connects
+        env:
+          DATABASE_URL: mysql://root@[::ffff:127.0.0.1]:3306/sqlx?sslmode=verify_identity&ssl-ca=.%2Ftests%2Fcerts%2Fca.crt&ssl-key=.%2Ftests%2Fcerts%2Fkeys%2Fclient.key&ssl-cert=.%2Ftests%2Fcerts%2Fclient.crt
+          RUSTFLAGS: --cfg mariadb="${{ matrix.mariadb }}"

@@ -1,0 +1,15 @@
+# Directories
+keys/
+rsa/
+
+# Keys
+*.key
+
+# Certificates
+*.crt
+
+# Certificate-signing requests
+*.csr
+
+# Serial number files
+*.srl

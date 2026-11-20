@@ -1,8 +1,18 @@
 use std::borrow::Cow;
 use std::env::var;
-use std::fmt::{Display, Write};
+use std::fmt::{self, Display, Write};
+use std::future::Future;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
 
+use crate::error::Error;
+use crate::net::Socket;
+use futures_core::future::BoxFuture;
+use futures_util::TryFutureExt;
+
+use sqlx_core::net::tls::TlsConnector;
+use sqlx_core::net::UrlHost;
 pub use ssl_mode::PgSslMode;
 
 use crate::{connection::LogSettings, net::tls::CertificateInput};
@@ -12,96 +22,39 @@ mod parse;
 mod pgpass;
 mod ssl_mode;
 
-/// Options and flags which can be used to configure a PostgreSQL connection.
-///
-/// A value of `PgConnectOptions` can be parsed from a connection URL,
-/// as described by [libpq](https://www.postgresql.org/docs/current/libpq-connect.html#LIBPQ-CONNSTRING).
-///
-/// The general form for a connection URL is:
-///
-/// ```text
-/// postgresql://[user[:password]@][host][:port][/dbname][?param1=value1&...]
-/// ```
-///
-/// This type also implements [`FromStr`][std::str::FromStr] so you can parse it from a string
-/// containing a connection URL and then further adjust options if necessary (see example below).
-///
-/// ## Parameters
-///
-/// |Parameter|Default|Description|
-/// |---------|-------|-----------|
-/// | `sslmode` | `prefer` | Determines whether or with what priority a secure SSL TCP/IP connection will be negotiated. See [`PgSslMode`]. |
-/// | `sslrootcert` | `None` | Sets the name of a file containing a list of trusted SSL Certificate Authorities. |
-/// | `statement-cache-capacity` | `100` | The maximum number of prepared statements stored in the cache. Set to `0` to disable. |
-/// | `host` | `None` | Path to the directory containing a PostgreSQL unix domain socket, which will be used instead of TCP if set. |
-/// | `hostaddr` | `None` | Same as `host`, but only accepts IP addresses. |
-/// | `application-name` | `None` | The name will be displayed in the pg_stat_activity view and included in CSV log entries. |
-/// | `user` | result of `whoami` | PostgreSQL user name to connect as. |
-/// | `password` | `None` | Password to be used if the server demands password authentication. |
-/// | `port` | `5432` | Port number to connect to at the server host, or socket file name extension for Unix-domain connections. |
-/// | `dbname` | `None` | The database name. |
-/// | `options` | `None` | The runtime parameters to send to the server at connection start. |
-///
-/// The URL scheme designator can be either `postgresql://` or `postgres://`.
-/// Each of the URL parts is optional.
-///
-/// ```text
-/// postgresql://
-/// postgresql://localhost
-/// postgresql://localhost:5433
-/// postgresql://localhost/mydb
-/// postgresql://user@localhost
-/// postgresql://user:secret@localhost
-/// postgresql://localhost?dbname=mydb&user=postgres&password=postgres
-/// ```
-///
-/// # Example
-///
-/// ```rust,no_run
-/// use sqlx::{Connection, ConnectOptions};
-/// use sqlx::postgres::{PgConnectOptions, PgConnection, PgPool, PgSslMode};
-///
-/// # async fn example() -> sqlx::Result<()> {
-/// // URL connection string
-/// let conn = PgConnection::connect("postgres://localhost/mydb").await?;
-///
-/// // Manually-constructed options
-/// let conn = PgConnectOptions::new()
-///     .host("secret-host")
-///     .port(2525)
-///     .username("secret-user")
-///     .password("secret-password")
-///     .ssl_mode(PgSslMode::Require)
-///     .connect()
-///     .await?;
-///
-/// // Modifying options parsed from a string
-/// let mut opts: PgConnectOptions = "postgres://localhost/mydb".parse()?;
-///
-/// // Change the log verbosity level for queries.
-/// // Information about SQL queries is logged at `DEBUG` level by default.
-/// opts.log_statements(log::LevelFilter::Trace);
-///
-/// let pool = PgPool::connect_with(&opts).await?;
-/// # }
-/// ```
+#[doc = include_str!("doc.md")]
 #[derive(Debug, Clone)]
 pub struct PgConnectOptions {
-    pub(crate) host: String,
+    pub(crate) host: UrlHost,
     pub(crate) port: u16,
+    pub(crate) hostaddr: Option<IpAddr>,
     pub(crate) socket: Option<PathBuf>,
     pub(crate) username: String,
     pub(crate) password: Option<String>,
     pub(crate) database: Option<String>,
-    pub(crate) ssl_mode: PgSslMode,
-    pub(crate) ssl_root_cert: Option<CertificateInput>,
-    pub(crate) ssl_client_cert: Option<CertificateInput>,
-    pub(crate) ssl_client_key: Option<CertificateInput>,
+    pub(crate) ssl_options: SslOptions,
     pub(crate) statement_cache_capacity: usize,
     pub(crate) application_name: Option<String>,
+    pub(crate) timezone: Option<Cow<'static, str>>,
     pub(crate) log_settings: LogSettings,
     pub(crate) extra_float_digits: Option<Cow<'static, str>>,
     pub(crate) options: Option<String>,
+    pub(crate) socket_factory: Option<SocketFactory>,
+    pub(crate) shared_type_cache: Option<Arc<crate::PgTypeCache>>,
+    pub(crate) close_unnamed_portal: bool,
+    pub(crate) close_named_statements: bool,
+    pub(crate) allow_missing_parse_complete: bool,
+}
+
+#[derive(Clone)]
+pub(crate) struct SocketFactory(
+    pub(crate) Arc<dyn Fn() -> BoxFuture<'static, Result<Box<dyn Socket>, Error>> + Send + Sync>,
+);
+
+impl fmt::Debug for SocketFactory {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("SocketFactory(..)")
+    }
 }
 
 impl Default for PgConnectOptions {
@@ -110,33 +63,30 @@ impl Default for PgConnectOptions {
     }
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct SslOptions {
+    pub(crate) ssl_mode: PgSslMode,
+    pub(crate) ssl_root_cert: Option<CertificateInput>,
+    pub(crate) ssl_client_cert: Option<CertificateInput>,
+    pub(crate) ssl_client_key: Option<CertificateInput>,
+    pub(crate) cached_connector: Arc<OnceLock<TlsConnector>>,
+}
+
 impl PgConnectOptions {
-    /// Creates a new, default set of options ready for configuration.
+    /// Create a default set of connection options populated from the current environment.
     ///
-    /// By default, this reads the following environment variables and sets their
-    /// equivalent options.
+    /// This behaves as if parsed from the connection string `postgres://`
     ///
-    ///  * `PGHOST`
-    ///  * `PGPORT`
-    ///  * `PGUSER`
-    ///  * `PGPASSWORD`
-    ///  * `PGDATABASE`
-    ///  * `PGSSLROOTCERT`
-    ///  * `PGSSLCERT`
-    ///  * `PGSSLKEY`
-    ///  * `PGSSLMODE`
-    ///  * `PGAPPNAME`
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// # use sqlx_postgres::PgConnectOptions;
-    /// let options = PgConnectOptions::new();
-    /// ```
+    /// See the type-level documentation for details.
     pub fn new() -> Self {
         Self::new_without_pgpass().apply_pgpass()
     }
 
+    /// Create a default set of connection options _without_ reading from `passfile`.
+    ///
+    /// Equivalent to [`PgConnectOptions::new()`] but `passfile` is ignored.
+    ///
+    /// See the type-level documentation for details.
     pub fn new_without_pgpass() -> Self {
         let port = var("PGPORT")
             .ok()
@@ -145,36 +95,123 @@ impl PgConnectOptions {
 
         let host = var("PGHOST").ok().unwrap_or_else(|| default_host(port));
 
-        let username = var("PGUSER").ok().unwrap_or_else(whoami::username);
+        let username = if let Ok(username) = var("PGUSER") {
+            username
+        } else if let Ok(username) = whoami::username() {
+            username
+        } else {
+            // keep the same fallback as previous version
+            "unknown".to_string()
+        };
 
         let database = var("PGDATABASE").ok();
 
         PgConnectOptions {
             port,
-            host,
+            host: host.into(),
+            hostaddr: var("PGHOSTADDR")
+                .ok()
+                .and_then(|hostaddr| hostaddr.parse().ok()),
             socket: None,
             username,
             password: var("PGPASSWORD").ok(),
             database,
-            ssl_root_cert: var("PGSSLROOTCERT").ok().map(CertificateInput::from),
-            ssl_client_cert: var("PGSSLCERT").ok().map(CertificateInput::from),
-            ssl_client_key: var("PGSSLKEY").ok().map(CertificateInput::from),
-            ssl_mode: var("PGSSLMODE")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or_default(),
+            ssl_options: SslOptions {
+                ssl_root_cert: var("PGSSLROOTCERT").ok().map(CertificateInput::from),
+                ssl_client_cert: var("PGSSLCERT").ok().map(CertificateInput::from),
+                // As of writing, the implementation of `From<String>` only looks for
+                // `-----BEGIN CERTIFICATE-----` and so will not attempt to parse
+                // a PEM-encoded private key.
+                ssl_client_key: var("PGSSLKEY").ok().map(CertificateInput::from),
+                ssl_mode: var("PGSSLMODE")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or_default(),
+                cached_connector: Arc::new(OnceLock::new()),
+            },
             statement_cache_capacity: 100,
+            timezone: Some("UTC".into()),
             application_name: var("PGAPPNAME").ok(),
             extra_float_digits: Some("2".into()),
             log_settings: Default::default(),
             options: var("PGOPTIONS").ok(),
+            socket_factory: None,
+            shared_type_cache: None,
+            close_unnamed_portal: true,
+            close_named_statements: true,
+            allow_missing_parse_complete: false,
         }
+    }
+
+    /// Supplies an already-connected transport for every new physical connection.
+    ///
+    /// This bypasses SQLx's DNS and socket creation, including when these options
+    /// are used with a pool. The factory must return a new independent socket on
+    /// each call. It must not retain request-owned sockets across requests.
+    ///
+    /// SQLx still negotiates TLS according to `ssl_mode`, using `host` for the TLS
+    /// server name, and performs normal PostgreSQL startup and authentication.
+    /// A factory for a platform binding may supply a transport secured by that
+    /// platform; configure its TLS policy explicitly for that transport.
+    ///
+    /// The factory is process-local and is not represented by `to_url_lossy()`.
+    pub fn socket_factory<F, Fut, S>(mut self, factory: F) -> Self
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<S, Error>> + Send + 'static,
+        S: Socket,
+    {
+        self.socket_factory = Some(SocketFactory(Arc::new(move || {
+            Box::pin(factory().map_ok(|socket| Box::new(socket) as Box<dyn Socket>))
+        })));
+        self
+    }
+
+    /// Shares resolved type metadata (custom types looked up in `pg_type`) between every
+    /// connection made with these options, and any others given the same cache.
+    ///
+    /// Use one [`PgTypeCache`][crate::PgTypeCache] per database. By default each
+    /// connection has its own cache.
+    pub fn shared_type_cache(mut self, cache: Arc<crate::PgTypeCache>) -> Self {
+        self.shared_type_cache = Some(cache);
+        self
+    }
+
+    /// Controls eager cleanup of the unnamed portal after each execution.
+    ///
+    /// Defaults to true. Some transaction-pooling proxies reject Close Portal
+    /// between Execute and Sync. Disabling it leaves the unnamed portal to be
+    /// destroyed by transaction end, the next unnamed Bind, or a simple Query,
+    /// as specified by PostgreSQL. Named statement cleanup is unchanged.
+    /// Execution still uses limit=0; result decoding and type checks are unchanged.
+    pub fn close_unnamed_portal(mut self, enabled: bool) -> Self {
+        self.close_unnamed_portal = enabled;
+        self
+    }
+
+    /// Allows a proxy to omit ParseComplete if the next message is the
+    /// expected ParameterDescription (or ReadyForQuery when reusing metadata).
+    /// Defaults to false. Error responses, parameter/row metadata, and all
+    /// subsequent protocol and decoding checks remain mandatory.
+    pub fn allow_missing_parse_complete(mut self, enabled: bool) -> Self {
+        self.allow_missing_parse_complete = enabled;
+        self
+    }
+
+    /// Controls Close Statement messages on local cache eviction or clearing.
+    /// Defaults to true. Disable only for proxies which reject these messages
+    /// and own backend statement cleanup. With false, clearing the SQLx cache
+    /// only clears client metadata; server resources are not eagerly freed.
+    /// Use request-scoped client connections so their lifetime stays bounded.
+    pub fn close_named_statements(mut self, enabled: bool) -> Self {
+        self.close_named_statements = enabled;
+        self
     }
 
     pub(crate) fn apply_pgpass(mut self) -> Self {
         if self.password.is_none() {
             self.password = pgpass::load_password(
-                &self.host,
+                self.host.original(),
                 self.port,
                 &self.username,
                 self.database.as_deref(),
@@ -201,7 +238,7 @@ impl PgConnectOptions {
     ///     .host("localhost");
     /// ```
     pub fn host(mut self, host: &str) -> Self {
-        self.host = host.to_owned();
+        self.host.set(host);
         self
     }
 
@@ -218,6 +255,23 @@ impl PgConnectOptions {
     /// ```
     pub fn port(mut self, port: u16) -> Self {
         self.port = port;
+        self
+    }
+
+    /// Override hostname resolution with a preset IP address.
+    ///
+    /// [`Self::host()`] is still used for TLS server name identification (SNI) if
+    /// [`Self::ssl_mode()`] is [`PgSslMode::VerifyFull`].
+    ///
+    /// This avoids DNS lookup overhead if the server IP is already known,
+    /// allows connecting to a host through a proxy,
+    /// or allows using SNI when connecting to a host that is not listed in DNS.
+    ///
+    /// Defaults to `None`.
+    ///
+    /// Has no effect if [`Self::socket()`] is set.
+    pub fn hostaddr(mut self, hostaddr: impl Into<IpAddr>) -> Self {
+        self.hostaddr = Some(hostaddr.into());
         self
     }
 
@@ -243,7 +297,7 @@ impl PgConnectOptions {
     ///     .username("postgres");
     /// ```
     pub fn username(mut self, username: &str) -> Self {
-        self.username = username.to_owned();
+        username.clone_into(&mut self.username);
         self
     }
 
@@ -276,6 +330,11 @@ impl PgConnectOptions {
         self
     }
 
+    fn ssl_options_mut(&mut self) -> &mut SslOptions {
+        Arc::make_mut(&mut self.ssl_options.cached_connector).take();
+        &mut self.ssl_options
+    }
+
     /// Sets whether or with what priority a secure SSL TCP/IP connection will be negotiated
     /// with the server.
     ///
@@ -292,7 +351,7 @@ impl PgConnectOptions {
     ///     .ssl_mode(PgSslMode::Require);
     /// ```
     pub fn ssl_mode(mut self, mode: PgSslMode) -> Self {
-        self.ssl_mode = mode;
+        self.ssl_options_mut().ssl_mode = mode;
         self
     }
 
@@ -310,7 +369,8 @@ impl PgConnectOptions {
     ///     .ssl_root_cert("./ca-certificate.crt");
     /// ```
     pub fn ssl_root_cert(mut self, cert: impl AsRef<Path>) -> Self {
-        self.ssl_root_cert = Some(CertificateInput::File(cert.as_ref().to_path_buf()));
+        self.ssl_options_mut().ssl_root_cert =
+            Some(CertificateInput::File(cert.as_ref().to_path_buf()));
         self
     }
 
@@ -326,7 +386,8 @@ impl PgConnectOptions {
     ///     .ssl_client_cert("./client.crt");
     /// ```
     pub fn ssl_client_cert(mut self, cert: impl AsRef<Path>) -> Self {
-        self.ssl_client_cert = Some(CertificateInput::File(cert.as_ref().to_path_buf()));
+        self.ssl_options_mut().ssl_client_cert =
+            Some(CertificateInput::File(cert.as_ref().to_path_buf()));
         self
     }
 
@@ -345,14 +406,15 @@ impl PgConnectOptions {
     /// -----BEGIN CERTIFICATE-----
     /// <Certificate data here.>
     /// -----END CERTIFICATE-----";
-    ///    
+    ///
     /// let options = PgConnectOptions::new()
     ///     // Providing a CA certificate with less than VerifyCa is pointless
     ///     .ssl_mode(PgSslMode::VerifyCa)
     ///     .ssl_client_cert_from_pem(CERT);
     /// ```
     pub fn ssl_client_cert_from_pem(mut self, cert: impl AsRef<[u8]>) -> Self {
-        self.ssl_client_cert = Some(CertificateInput::Inline(cert.as_ref().to_vec()));
+        self.ssl_options_mut().ssl_client_cert =
+            Some(CertificateInput::Inline(cert.as_ref().to_vec()));
         self
     }
 
@@ -368,7 +430,8 @@ impl PgConnectOptions {
     ///     .ssl_client_key("./client.key");
     /// ```
     pub fn ssl_client_key(mut self, key: impl AsRef<Path>) -> Self {
-        self.ssl_client_key = Some(CertificateInput::File(key.as_ref().to_path_buf()));
+        self.ssl_options_mut().ssl_client_key =
+            Some(CertificateInput::File(key.as_ref().to_path_buf()));
         self
     }
 
@@ -394,7 +457,8 @@ impl PgConnectOptions {
     ///     .ssl_client_key_from_pem(KEY);
     /// ```
     pub fn ssl_client_key_from_pem(mut self, key: impl AsRef<[u8]>) -> Self {
-        self.ssl_client_key = Some(CertificateInput::Inline(key.as_ref().to_vec()));
+        self.ssl_options_mut().ssl_client_key =
+            Some(CertificateInput::Inline(key.as_ref().to_vec()));
         self
     }
 
@@ -410,7 +474,7 @@ impl PgConnectOptions {
     ///     .ssl_root_cert_from_pem(vec![]);
     /// ```
     pub fn ssl_root_cert_from_pem(mut self, pem_certificate: Vec<u8>) -> Self {
-        self.ssl_root_cert = Some(CertificateInput::Inline(pem_certificate));
+        self.ssl_options_mut().ssl_root_cert = Some(CertificateInput::Inline(pem_certificate));
         self
     }
 
@@ -436,6 +500,26 @@ impl PgConnectOptions {
     /// ```
     pub fn application_name(mut self, application_name: &str) -> Self {
         self.application_name = Some(application_name.to_owned());
+        self
+    }
+
+    /// Sets or removes the `TimeZone` sent in the startup packet.
+    ///
+    /// Defaults to `Some("UTC")`. With `None` the parameter is not sent, so the session
+    /// starts on the role's or database's default (`ALTER ROLE .. SET TimeZone`).
+    ///
+    /// Setting `TimeZone` through [`options`][Self::options] does not override this:
+    /// the server applies `options` before the startup parameters.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use sqlx_postgres::PgConnectOptions;
+    /// let options = PgConnectOptions::new()
+    ///     .timezone(None::<&str>);
+    /// ```
+    pub fn timezone(mut self, timezone: Option<impl Into<Cow<'static, str>>>) -> Self {
+        self.timezone = timezone.map(Into::into);
         self
     }
 
@@ -494,6 +578,9 @@ impl PgConnectOptions {
 
     /// Set additional startup options for the connection as a list of key-value pairs.
     ///
+    /// Escapes the options’ backslash and space characters as per
+    /// https://www.postgresql.org/docs/current/libpq-connect.html#LIBPQ-CONNECT-OPTIONS
+    ///
     /// # Example
     ///
     /// ```rust
@@ -514,21 +601,22 @@ impl PgConnectOptions {
                 options_str.push(' ');
             }
 
-            write!(options_str, "-c {k}={v}").expect("failed to write an option to the string");
+            options_str.push_str("-c ");
+            write!(PgOptionsWriteEscaped(options_str), "{k}={v}").ok();
         }
         self
     }
 
     /// We try using a socket if hostname starts with `/` or if socket parameter
     /// is specified.
-    pub(crate) fn fetch_socket(&self) -> Option<String> {
+    pub(crate) fn make_socket_path(&self) -> Option<String> {
         match self.socket {
             Some(ref socket) => {
                 let full_path = format!("{}/.s.PGSQL.{}", socket.display(), self.port);
                 Some(full_path)
             }
-            None if self.host.starts_with('/') => {
-                let full_path = format!("{}/.s.PGSQL.{}", self.host, self.port);
+            None if self.host.original().starts_with('/') => {
+                let full_path = format!("{}/.s.PGSQL.{}", self.host.original(), self.port);
                 Some(full_path)
             }
             _ => None,
@@ -548,7 +636,7 @@ impl PgConnectOptions {
     /// assert_eq!(options.get_host(), "127.0.0.1");
     /// ```
     pub fn get_host(&self) -> &str {
-        &self.host
+        self.host.original()
     }
 
     /// Get the server's port.
@@ -617,7 +705,7 @@ impl PgConnectOptions {
     /// assert!(matches!(options.get_ssl_mode(), PgSslMode::Prefer));
     /// ```
     pub fn get_ssl_mode(&self) -> PgSslMode {
-        self.ssl_mode
+        self.ssl_options.ssl_mode
     }
 
     /// Get the application name.
@@ -668,6 +756,39 @@ fn default_host(port: u16) -> String {
     "localhost".to_owned()
 }
 
+/// Writer that escapes passed-in PostgreSQL options.
+///
+/// Escapes backslashes and spaces with an additional backslash according to
+/// https://www.postgresql.org/docs/current/libpq-connect.html#LIBPQ-CONNECT-OPTIONS
+#[derive(Debug)]
+struct PgOptionsWriteEscaped<'a>(&'a mut String);
+
+impl Write for PgOptionsWriteEscaped<'_> {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        let mut span_start = 0;
+
+        for (span_end, matched) in s.match_indices([' ', '\\']) {
+            write!(self.0, r"{}\{matched}", &s[span_start..span_end])?;
+            span_start = span_end + matched.len();
+        }
+
+        // Write the rest of the string after the last match, or all of it if no matches
+        self.0.push_str(&s[span_start..]);
+
+        Ok(())
+    }
+
+    fn write_char(&mut self, ch: char) -> fmt::Result {
+        if matches!(ch, ' ' | '\\') {
+            self.0.push('\\');
+        }
+
+        self.0.push(ch);
+
+        Ok(())
+    }
+}
+
 #[test]
 fn test_options_formatting() {
     let options = PgConnectOptions::new().options([("geqo", "off")]);
@@ -682,6 +803,26 @@ fn test_options_formatting() {
         options.options,
         Some("-c geqo=off -c statement_timeout=5min".to_string())
     );
+    // https://www.postgresql.org/docs/current/libpq-connect.html#LIBPQ-CONNECT-OPTIONS
+    let options =
+        PgConnectOptions::new().options([("application_name", r"/back\slash/ and\ spaces")]);
+    assert_eq!(
+        options.options,
+        Some(r"-c application_name=/back\\slash/\ and\\\ spaces".to_string())
+    );
     let options = PgConnectOptions::new();
     assert_eq!(options.options, None);
+}
+
+#[test]
+fn test_pg_write_escaped() {
+    let mut buf = String::new();
+    let mut x = PgOptionsWriteEscaped(&mut buf);
+    x.write_str("x").unwrap();
+    x.write_str("").unwrap();
+    x.write_char('\\').unwrap();
+    x.write_str("y \\").unwrap();
+    x.write_char(' ').unwrap();
+    x.write_char('z').unwrap();
+    assert_eq!(buf, r"x\\y\ \\\ z");
 }

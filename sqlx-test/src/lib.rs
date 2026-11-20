@@ -1,5 +1,5 @@
 use sqlx::pool::PoolOptions;
-use sqlx::{Connection, Database, Pool};
+use sqlx::{Connection, Database, Error, Pool};
 use std::env;
 
 pub fn setup_if_needed() {
@@ -9,13 +9,15 @@ pub fn setup_if_needed() {
 
 // Make a new connection
 // Ensure [dotenvy] and [env_logger] have been setup
-pub async fn new<DB>() -> anyhow::Result<DB::Connection>
+pub async fn new<DB>() -> sqlx::Result<DB::Connection>
 where
     DB: Database,
 {
     setup_if_needed();
 
-    Ok(DB::Connection::connect(&env::var("DATABASE_URL")?).await?)
+    let db_url = env::var("DATABASE_URL").map_err(|e| Error::Configuration(Box::new(e)))?;
+
+    Ok(DB::Connection::connect(&db_url).await?)
 }
 
 // Make a new pool
@@ -51,6 +53,18 @@ macro_rules! test_type {
         }
     };
 
+    ($name:ident<$ty:ty>($db:ident, $($text:literal ~= $value:expr),+ $(,)?)) => {
+        paste::item! {
+            $crate::__test_prepared_type!($name<$ty>($db, $crate::[< $db _query_for_test_prepared_geometric_type >]!(), $($text == $value),+));
+        }
+    };
+    ($name:ident<$ty:ty>($db:ident, $($text:literal @= $value:expr),+ $(,)?)) => {
+        paste::item! {
+            $crate::__test_prepared_type!($name<$ty>($db, $crate::[< $db _query_for_test_prepared_geometric_array_type >]!(), $($text == $value),+));
+        }
+    };
+
+
     ($name:ident($db:ident, $($text:literal == $value:expr),+ $(,)?)) => {
         $crate::test_type!($name<$name>($db, $($text == $value),+));
     };
@@ -82,6 +96,7 @@ macro_rules! test_prepared_type {
         }
     };
 
+
     ($name:ident($db:ident, $($text:literal == $value:expr),+ $(,)?)) => {
         $crate::__test_prepared_type!($name<$name>($db, $($text == $value),+));
     };
@@ -95,13 +110,14 @@ macro_rules! test_unprepared_type {
             #[sqlx_macros::test]
             async fn [< test_unprepared_type_ $name >] () -> anyhow::Result<()> {
                 use sqlx::prelude::*;
-                use futures::TryStreamExt;
+                use sqlx_core::sql_str::AssertSqlSafe;
+                use futures_util::TryStreamExt;
 
                 let mut conn = sqlx_test::new::<$db>().await?;
 
                 $(
                     let query = format!("SELECT {}", $text);
-                    let mut s = conn.fetch(&*query);
+                    let mut s = conn.fetch(AssertSqlSafe(query));
                     let row = s.try_next().await?.unwrap();
                     let rec = row.try_get::<$ty, _>(0)?;
 
@@ -124,13 +140,14 @@ macro_rules! __test_prepared_decode_type {
             #[sqlx_macros::test]
             async fn [< test_prepared_decode_type_ $name >] () -> anyhow::Result<()> {
                 use sqlx::Row;
+                use sqlx_core::sql_str::AssertSqlSafe;
 
                 let mut conn = sqlx_test::new::<$db>().await?;
 
                 $(
                     let query = format!("SELECT {}", $text);
 
-                    let row = sqlx::query(&query)
+                    let row = sqlx::query(AssertSqlSafe(query))
                         .fetch_one(&mut conn)
                         .await?;
 
@@ -153,6 +170,7 @@ macro_rules! __test_prepared_type {
             #[sqlx_macros::test]
             async fn [< test_prepared_type_ $name >] () -> anyhow::Result<()> {
                 use sqlx::Row;
+                use sqlx_core::sql_str::AssertSqlSafe;
 
                 let mut conn = sqlx_test::new::<$db>().await?;
 
@@ -160,7 +178,7 @@ macro_rules! __test_prepared_type {
                     let query = format!($sql, $text);
                     println!("{query}");
 
-                    let row = sqlx::query(&query)
+                    let row = sqlx::query(AssertSqlSafe(query))
                         .bind($value)
                         .bind($value)
                         .fetch_one(&mut conn)
@@ -221,5 +239,19 @@ macro_rules! Sqlite_query_for_test_prepared_type {
 macro_rules! Postgres_query_for_test_prepared_type {
     () => {
         "SELECT ({0} is not distinct from $1)::int4, {0}, $2"
+    };
+}
+
+#[macro_export]
+macro_rules! Postgres_query_for_test_prepared_geometric_type {
+    () => {
+        "SELECT ({0} ~= $1)::int4, {0}, $2"
+    };
+}
+
+#[macro_export]
+macro_rules! Postgres_query_for_test_prepared_geometric_array_type {
+    () => {
+        "SELECT (SELECT bool_and(geo1.geometry ~= geo2.geometry) FROM unnest({0}) WITH ORDINALITY AS geo1(geometry, idx) JOIN unnest($1) WITH ORDINALITY AS geo2(geometry, idx) ON geo1.idx = geo2.idx)::int4, {0}, $2"
     };
 }

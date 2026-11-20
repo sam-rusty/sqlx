@@ -3,12 +3,13 @@ use crate::HashMap;
 use crate::common::StatementCache;
 use crate::connection::{sasl, stream::PgStream};
 use crate::error::Error;
-use crate::io::Decode;
+use crate::io::StatementId;
 use crate::message::{
-    Authentication, BackendKeyData, MessageFormat, Password, ReadyForQuery, Startup,
+    Authentication, BackendKeyData, BackendMessageFormat, Password, ReadyForQuery, Startup,
 };
-use crate::types::Oid;
 use crate::{PgConnectOptions, PgConnection};
+
+use super::PgConnectionInner;
 
 // https://www.postgresql.org/docs/current/protocol-flow.html#id-1.10.5.7.3
 // https://www.postgresql.org/docs/current/protocol-flow.html#id-1.10.5.7.11
@@ -28,9 +29,12 @@ impl PgConnection {
             // Sets the client-side encoding (character set).
             // <https://www.postgresql.org/docs/devel/multibyte.html#MULTIBYTE-CHARSET-SUPPORTED>
             ("client_encoding", "UTF8"),
-            // Sets the time zone for displaying and interpreting time stamps.
-            ("TimeZone", "UTC"),
         ];
+
+        // Sets the time zone for displaying and interpreting time stamps.
+        if let Some(ref timezone) = options.timezone {
+            params.push(("TimeZone", timezone));
+        }
 
         if let Some(ref extra_float_digits) = options.extra_float_digits {
             params.push(("extra_float_digits", extra_float_digits));
@@ -44,13 +48,13 @@ impl PgConnection {
             params.push(("options", options));
         }
 
-        stream
-            .send(Startup {
-                username: Some(&options.username),
-                database: options.database.as_deref(),
-                params: &params,
-            })
-            .await?;
+        stream.write(Startup {
+            username: Some(&options.username),
+            database: options.database.as_deref(),
+            params: &params,
+        })?;
+
+        stream.flush().await?;
 
         // The server then uses this information and the contents of
         // its configuration files (such as pg_hba.conf) to determine whether the connection is
@@ -64,7 +68,7 @@ impl PgConnection {
         loop {
             let message = stream.recv().await?;
             match message.format {
-                MessageFormat::Authentication => match message.decode()? {
+                BackendMessageFormat::Authentication => match message.decode()? {
                     Authentication::Ok => {
                         // the authentication exchange is successfully completed
                         // do nothing; no more information is required to continue
@@ -108,7 +112,7 @@ impl PgConnection {
                     }
                 },
 
-                MessageFormat::BackendKeyData => {
+                BackendMessageFormat::BackendKeyData => {
                     // provides secret-key data that the frontend must save if it wants to be
                     // able to issue cancel requests later
 
@@ -118,10 +122,9 @@ impl PgConnection {
                     secret_key = data.secret_key;
                 }
 
-                MessageFormat::ReadyForQuery => {
+                BackendMessageFormat::ReadyForQuery => {
                     // start-up is completed. The frontend can now issue commands
-                    transaction_status =
-                        ReadyForQuery::decode(message.contents)?.transaction_status;
+                    transaction_status = message.decode::<ReadyForQuery>()?.transaction_status;
 
                     break;
                 }
@@ -135,18 +138,29 @@ impl PgConnection {
             }
         }
 
-        Ok(PgConnection {
-            stream,
-            process_id,
-            secret_key,
-            transaction_status,
-            transaction_depth: 0,
-            pending_ready_for_query_count: 0,
-            next_statement_id: Oid(1),
-            cache_statement: StatementCache::new(options.statement_cache_capacity),
-            cache_type_oid: HashMap::new(),
-            cache_type_info: HashMap::new(),
-            log_settings: options.log_settings.clone(),
-        })
+        let mut conn = PgConnection {
+            inner: Box::new(PgConnectionInner {
+                stream,
+                process_id,
+                secret_key,
+                transaction_status,
+                transaction_depth: 0,
+                pending_ready_for_query_count: 0,
+                next_statement_id: StatementId::NAMED_START,
+                cache_statement: StatementCache::new(options.statement_cache_capacity),
+                close_unnamed_portal: options.close_unnamed_portal,
+                close_named_statements: options.close_named_statements,
+                allow_missing_parse_complete: options.allow_missing_parse_complete,
+                cache_type_oid: HashMap::new(),
+                cache_type_info: HashMap::new(),
+                cache_elem_type_to_array: HashMap::new(),
+                cache_table_data: HashMap::new(),
+                shared_type_cache: options.shared_type_cache.clone(),
+                log_settings: options.log_settings.clone(),
+            }),
+        };
+        conn.pull_shared_types();
+
+        Ok(conn)
     }
 }

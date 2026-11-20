@@ -40,6 +40,14 @@
     <a href="https://docs.rs/sqlx">
       Docs
     </a>
+    <span> | </span>
+    <a href="https://github.com/launchbadge/sqlx/wiki/Ecosystem">
+      Ecosystem
+    </a>    
+    <span> | </span>
+    <a href="https://discord.gg/uuruzJ7">
+      Discord
+    </a>
   </h4>
 </div>
 
@@ -75,7 +83,7 @@ SQLx is an async, pure Rust<sub>†</sub> SQL crate featuring compile-time check
 † The SQLite driver uses the libsqlite3 C library as SQLite is an embedded database (the only way
 we could be pure Rust for SQLite is by porting _all_ of SQLite to Rust).
 
-†† SQLx uses `#![forbid(unsafe_code)]` unless the `sqlite` feature is enabled. 
+†† SQLx uses `#![forbid(unsafe_code)]` unless the `sqlite` feature is enabled.
 The SQLite driver directly invokes the SQLite3 API via `libsqlite3-sys`, which requires `unsafe`.
 
 </small></small>
@@ -125,18 +133,30 @@ SQLx is compatible with the [`async-std`], [`tokio`], and [`actix`] runtimes; an
 # PICK ONE OF THE FOLLOWING:
 
 # tokio (no TLS)
-sqlx = { version = "0.7", features = [ "runtime-tokio" ] }
+sqlx = { version = "0.9", features = [ "runtime-tokio" ] }
 # tokio + native-tls
-sqlx = { version = "0.7", features = [ "runtime-tokio", "tls-native-tls" ] }
-# tokio + rustls
-sqlx = { version = "0.7", features = [ "runtime-tokio", "tls-rustls" ] }
+sqlx = { version = "0.9", features = [ "runtime-tokio", "tls-native-tls" ] }
+# tokio + rustls with ring and WebPKI CA certificates
+sqlx = { version = "0.9", features = [ "runtime-tokio", "tls-rustls-ring-webpki" ] }
+# tokio + rustls with ring and platform's native CA certificates
+sqlx = { version = "0.9", features = [ "runtime-tokio", "tls-rustls-ring-native-roots" ] }
+# tokio + rustls with aws-lc-rs and WebPKI CA certificates
+sqlx = { version = "0.9", features = [ "runtime-tokio", "tls-rustls-aws-lc-rs" ] }
+# tokio + rustls with aws-lc-rs and platform's native CA certificates
+sqlx = { version = "0.9", features = [ "runtime-tokio", "tls-rustls-aws-lc-rs-native-roots" ] }
 
 # async-std (no TLS)
-sqlx = { version = "0.7", features = [ "runtime-async-std" ] }
+sqlx = { version = "0.9", features = [ "runtime-async-std" ] }
 # async-std + native-tls
-sqlx = { version = "0.7", features = [ "runtime-async-std", "tls-native-tls" ] }
-# async-std + rustls
-sqlx = { version = "0.7", features = [ "runtime-async-std", "tls-rustls" ] }
+sqlx = { version = "0.9", features = [ "runtime-async-std", "tls-native-tls" ] }
+# async-std + rustls with ring and WebPKI CA certificates
+sqlx = { version = "0.9", features = [ "runtime-async-std", "tls-rustls-ring-webpki" ] }
+# async-std + rustls with ring and platform's native CA certificates
+sqlx = { version = "0.9", features = [ "runtime-async-std", "tls-rustls-ring-native-roots" ] }
+# async-std + rustls with aws-lc-rs and WebPKI CA certificates
+sqlx = { version = "0.9", features = [ "runtime-async-std", "tls-rustls-aws-lc-rs" ] }
+# async-std + rustls with aws-lc-rs and platform's native CA certificates
+sqlx = { version = "0.9", features = [ "runtime-async-std", "tls-rustls-aws-lc-rs-native-roots" ] }
 ```
 
 #### Cargo Feature Flags
@@ -149,37 +169,46 @@ be removed in the future.
 
 -   `runtime-async-std`: Use the `async-std` runtime without enabling a TLS backend.
 
--   `runtime-async-std-native-tls`: Use the `async-std` runtime and `native-tls` TLS backend (SOFT-DEPRECATED).
-
--   `runtime-async-std-rustls`: Use the `async-std` runtime and `rustls` TLS backend (SOFT-DEPRECATED).
-
 -   `runtime-tokio`: Use the `tokio` runtime without enabling a TLS backend.
-
--   `runtime-tokio-native-tls`: Use the `tokio` runtime and `native-tls` TLS backend (SOFT-DEPRECATED).
-
--   `runtime-tokio-rustls`: Use the `tokio` runtime and `rustls` TLS backend (SOFT-DEPRECATED).
 
     - Actix-web is fully compatible with Tokio and so a separate runtime feature is no longer needed.
 
 -   `tls-native-tls`: Use the `native-tls` TLS backend (OpenSSL on *nix, SChannel on Windows, Secure Transport on macOS).
 
 -   `tls-rustls`: Use the `rustls` TLS backend (cross-platform backend, only supports TLS 1.2 and 1.3).
+-   `tls-rustls-aws-lc-rs`: Use the `rustls` TLS backend with `aws-lc-rs` and bundled WebPKI CA certificates.
+-   `tls-rustls-aws-lc-rs-native-roots`: Use the `rustls` TLS backend with `aws-lc-rs` and the platform's native CA certificates.
 
 -   `postgres`: Add support for the Postgres database server.
 
 -   `mysql`: Add support for the MySQL/MariaDB database server.
+-   Note: RSA auth without TLS requires `mysql-rsa` (not enabled by `mysql`).
+-   `mysql-rsa`: Enable RSA password encryption for `caching_sha2_password`/`sha256_password` when TLS is off. Only enable it if you must connect without TLS to servers that require RSA auth. Prefer using TLS.
 
 -   `mssql`: Add support for the MSSQL database server.
 
--   `sqlite`: Add support for the self-contained [SQLite](https://sqlite.org/) database engine.
+-   `sqlite`: Add support for the self-contained [SQLite](https://sqlite.org/) database engine with SQLite bundled and statically-linked.
+
+-   `sqlite-unbundled`: The same as above (`sqlite`), but link SQLite from the system instead of the bundled version.
+    * Allows updating SQLite independently of SQLx or using forked versions.
+    * You must have SQLite installed on the system or provide a path to the library at build time.
+       See [the `rusqlite` README](https://github.com/rusqlite/rusqlite?tab=readme-ov-file#notes-on-building-rusqlite-and-libsqlite3-sys) for details.
+    * May result in link errors if the SQLite version is too old. Version `3.20.0` or newer is recommended.
+    * Can increase build time due to the use of bindgen.
+
+-   `sqlite-preupdate-hook`: enables SQLite's [preupdate hook](https://sqlite.org/c3ref/preupdate_count.html) API.
+    * Exposed as a separate feature because it's generally not enabled by default.
+    * Using this feature with `sqlite-unbundled` may cause linker failures if the system SQLite version does not support it.
 
 -   `any`: Add support for the `Any` database driver, which can proxy to a database driver at runtime.
+
+-   `derive`: Add support for the derive family macros, those are `FromRow`, `Type`, `Encode`, `Decode`.
 
 -   `macros`: Add support for the `query*!` macros, which allows compile-time checked queries.
 
 -   `migrate`: Add support for the migration management and `migrate!` macro, which allow compile-time embedded migrations.
 
--   `uuid`: Add support for UUID (in Postgres).
+-   `uuid`: Add support for UUID.
 
 -   `chrono`: Add support for date and time types from `chrono`.
 
@@ -190,6 +219,8 @@ be removed in the future.
 -   `bigdecimal`: Add support for `NUMERIC` using the `bigdecimal` crate.
 
 -   `rust_decimal`: Add support for `NUMERIC` using the `rust_decimal` crate.
+
+-   `ipnet`: Add support for `INET` and `CIDR` (in postgres) using the `ipnet` crate.
 
 -   `ipnetwork`: Add support for `INET` and `CIDR` (in postgres) using the `ipnetwork` crate.
 
@@ -212,8 +243,7 @@ some info on) your SQL queries. This has some potentially surprising implication
 - Due to the different amount of information databases let you retrieve about queries, the extent of
   SQL verification you get from the query macros depends on the database
 
-**If you are looking for an (asynchronous) ORM,** you can check out [`ormx`] or [`SeaORM`], which is built on top
-of SQLx.
+**If you are looking for an (asynchronous) ORM,** you can check out our new [Ecosystem wiki page](https://github.com/launchbadge/sqlx/wiki/Ecosystem#orms)!
 
 [`ormx`]: https://crates.io/crates/ormx
 [`SeaORM`]: https://github.com/SeaQL/sea-orm
@@ -304,10 +334,12 @@ The `fetch` query finalizer returns a stream-like type that iterates through the
 
 ```rust
 // provides `try_next`
-use futures::TryStreamExt;
+use futures_util::TryStreamExt;
+// provides `try_get`
+use sqlx::Row;
 
 let mut rows = sqlx::query("SELECT * FROM users WHERE email = ?")
-    .bind(email)
+    .bind("user@example.com")
     .fetch(&mut conn);
 
 while let Some(row) = rows.try_next().await? {
@@ -331,8 +363,8 @@ let mut stream = sqlx::query("SELECT * FROM users")
 struct User { name: String, id: i64 }
 
 let mut stream = sqlx::query_as::<_, User>("SELECT * FROM users WHERE email = ? OR name = ?")
-    .bind(user_email)
-    .bind(user_name)
+    .bind("user@example.com")
+    .bind("example_username")
     .fetch(&mut conn);
 ```
 
@@ -376,16 +408,16 @@ Differences from `query()`:
     queries against; the database does not have to contain any data but must be the same
     kind (MySQL, Postgres, etc.) and have the same schema as the database you will be connecting to at runtime.
 
-    For convenience, you can use [a `.env` file][dotenv]<sup>1</sup> to set DATABASE_URL so that you don't have to pass it every time:
+    For convenience, you can use [a `.env` file][dotenvy]<sup>1</sup> to set DATABASE_URL so that you don't have to pass it every time:
 
     ```
     DATABASE_URL=mysql://localhost/my_database
     ```
 
-[dotenv]: https://github.com/dotenv-rs/dotenv#examples
+[dotenvy]: https://github.com/allan2/dotenvy?tab=readme-ov-file#what-is-an-environment-file
 
 The biggest downside to `query!()` is that the output type cannot be named (due to Rust not
-officially supporting anonymous records). To address that, there is a `query_as!()` macro that is 
+officially supporting anonymous records). To address that, there is a `query_as!()` macro that is
 mostly identical except that you can name the output type.
 
 ```rust

@@ -7,7 +7,7 @@ use crate::{
     error::BoxDynError,
     type_info::DataType,
     types::Type,
-    Sqlite, SqliteArgumentValue, SqliteTypeInfo, SqliteValueRef,
+    Sqlite, SqliteArgumentsBuffer, SqliteTypeInfo, SqliteValueRef,
 };
 use chrono::FixedOffset;
 use chrono::{
@@ -32,7 +32,11 @@ impl Type<Sqlite> for NaiveDateTime {
     fn compatible(ty: &SqliteTypeInfo) -> bool {
         matches!(
             ty.0,
-            DataType::Datetime | DataType::Text | DataType::Int64 | DataType::Int | DataType::Float
+            DataType::Datetime
+                | DataType::Text
+                | DataType::Integer
+                | DataType::Int4
+                | DataType::Float
         )
     }
 }
@@ -61,25 +65,25 @@ impl<Tz: TimeZone> Encode<'_, Sqlite> for DateTime<Tz>
 where
     Tz::Offset: Display,
 {
-    fn encode_by_ref(&self, buf: &mut Vec<SqliteArgumentValue<'_>>) -> IsNull {
+    fn encode_by_ref(&self, buf: &mut SqliteArgumentsBuffer) -> Result<IsNull, BoxDynError> {
         Encode::<Sqlite>::encode(self.to_rfc3339_opts(SecondsFormat::AutoSi, false), buf)
     }
 }
 
 impl Encode<'_, Sqlite> for NaiveDateTime {
-    fn encode_by_ref(&self, buf: &mut Vec<SqliteArgumentValue<'_>>) -> IsNull {
+    fn encode_by_ref(&self, buf: &mut SqliteArgumentsBuffer) -> Result<IsNull, BoxDynError> {
         Encode::<Sqlite>::encode(self.format("%F %T%.f").to_string(), buf)
     }
 }
 
 impl Encode<'_, Sqlite> for NaiveDate {
-    fn encode_by_ref(&self, buf: &mut Vec<SqliteArgumentValue<'_>>) -> IsNull {
+    fn encode_by_ref(&self, buf: &mut SqliteArgumentsBuffer) -> Result<IsNull, BoxDynError> {
         Encode::<Sqlite>::encode(self.format("%F").to_string(), buf)
     }
 }
 
 impl Encode<'_, Sqlite> for NaiveTime {
-    fn encode_by_ref(&self, buf: &mut Vec<SqliteArgumentValue<'_>>) -> IsNull {
+    fn encode_by_ref(&self, buf: &mut SqliteArgumentsBuffer) -> Result<IsNull, BoxDynError> {
         Encode::<Sqlite>::encode(self.format("%T%.f").to_string(), buf)
     }
 }
@@ -104,9 +108,9 @@ impl<'r> Decode<'r, Sqlite> for DateTime<FixedOffset> {
 
 fn decode_datetime(value: SqliteValueRef<'_>) -> Result<DateTime<FixedOffset>, BoxDynError> {
     let dt = match value.type_info().0 {
-        DataType::Text => decode_datetime_from_text(value.text()?),
-        DataType::Int | DataType::Int64 => decode_datetime_from_int(value.int64()),
-        DataType::Float => decode_datetime_from_float(value.double()),
+        DataType::Text => decode_datetime_from_text(value.text_borrowed()?),
+        DataType::Int4 | DataType::Integer => decode_datetime_from_int(value.int64()?),
+        DataType::Float => decode_datetime_from_float(value.double()?),
 
         _ => None,
     };
@@ -114,7 +118,7 @@ fn decode_datetime(value: SqliteValueRef<'_>) -> Result<DateTime<FixedOffset>, B
     if let Some(dt) = dt {
         Ok(dt)
     } else {
-        Err(format!("invalid datetime: {}", value.text()?).into())
+        Err(format!("invalid datetime: {}", value.text_borrowed()?).into())
     }
 }
 
@@ -156,17 +160,33 @@ fn decode_datetime_from_text(value: &str) -> Option<DateTime<FixedOffset>> {
 }
 
 fn decode_datetime_from_int(value: i64) -> Option<DateTime<FixedOffset>> {
-    NaiveDateTime::from_timestamp_opt(value, 0).map(|dt| Utc.fix().from_utc_datetime(&dt))
+    Utc.fix().timestamp_opt(value, 0).single()
 }
 
 fn decode_datetime_from_float(value: f64) -> Option<DateTime<FixedOffset>> {
     let epoch_in_julian_days = 2_440_587.5;
     let seconds_in_day = 86400.0;
     let timestamp = (value - epoch_in_julian_days) * seconds_in_day;
-    let seconds = timestamp as i64;
-    let nanos = (timestamp.fract() * 1E9) as u32;
 
-    NaiveDateTime::from_timestamp_opt(seconds, nanos).map(|dt| Utc.fix().from_utc_datetime(&dt))
+    if !timestamp.is_finite() {
+        return None;
+    }
+
+    // We don't really have a choice but to do lossy casts for this conversion
+    // We checked above if the value is infinite or NaN which could otherwise cause problems
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    {
+        // Split into whole seconds and a non-negative sub-second remainder.
+        // `timestamp_opt` always adds `nanos` *forward* in time, so we must round
+        // `seconds` toward negative infinity (not toward zero) and take the
+        // fraction relative to that. Using `trunc()`/`fract().abs()` here would
+        // push pre-epoch timestamps up to ~2 seconds off (and onto the wrong side
+        // of the epoch), since the fractional part is negative below zero.
+        let seconds = timestamp.floor();
+        let nanos = ((timestamp - seconds) * 1E9) as u32;
+
+        Utc.fix().timestamp_opt(seconds as i64, nanos).single()
+    }
 }
 
 impl<'r> Decode<'r, Sqlite> for NaiveDateTime {
@@ -177,13 +197,13 @@ impl<'r> Decode<'r, Sqlite> for NaiveDateTime {
 
 impl<'r> Decode<'r, Sqlite> for NaiveDate {
     fn decode(value: SqliteValueRef<'r>) -> Result<Self, BoxDynError> {
-        Ok(NaiveDate::parse_from_str(value.text()?, "%F")?)
+        Ok(NaiveDate::parse_from_str(value.text_borrowed()?, "%F")?)
     }
 }
 
 impl<'r> Decode<'r, Sqlite> for NaiveTime {
     fn decode(value: SqliteValueRef<'r>) -> Result<Self, BoxDynError> {
-        let value = value.text()?;
+        let value = value.text_borrowed()?;
 
         // Loop over common time patterns, inspired by Diesel
         // https://github.com/diesel-rs/diesel/blob/93ab183bcb06c69c0aee4a7557b6798fd52dd0d8/diesel/src/sqlite/types/date_and_time/chrono.rs#L29-L47
@@ -202,5 +222,59 @@ impl<'r> Decode<'r, Sqlite> for NaiveTime {
         }
 
         Err(format!("invalid time: {value}").into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decode_datetime_from_float;
+    use chrono::{Offset, TimeZone, Utc};
+
+    // SQLite may store a datetime as a REAL holding a Julian day number, e.g. the
+    // result of `julianday(...)`. This mirrors that conversion so a test can feed
+    // `decode_datetime_from_float` the value for a known instant.
+    fn julian_day(unix_seconds: f64) -> f64 {
+        2_440_587.5 + unix_seconds / 86_400.0
+    }
+
+    // Assert that the Julian day for `unix_seconds + subsec_nanos` decodes back to
+    // that same instant. The tolerance only absorbs f64 round-off in the
+    // round-trip (tens of microseconds), well below the errors under test.
+    #[track_caller]
+    fn assert_decodes_near(unix_seconds: i64, subsec_nanos: u32) {
+        let input = julian_day(unix_seconds as f64 + f64::from(subsec_nanos) / 1e9);
+        let decoded = decode_datetime_from_float(input).expect("valid Julian day should decode");
+        let expected = Utc
+            .fix()
+            .timestamp_opt(unix_seconds, subsec_nanos)
+            .single()
+            .unwrap();
+
+        let diff_us = (decoded - expected)
+            .num_microseconds()
+            .expect("difference fits in microseconds")
+            .abs();
+        assert!(
+            diff_us < 1_000,
+            "decoded {decoded} differs from expected {expected} by {diff_us} us",
+        );
+    }
+
+    // A Julian day landing before the UNIX epoch must keep its sub-second part in
+    // the correct direction. Before the fix these decoded up to ~2 seconds off,
+    // and could even cross to the wrong side of the epoch.
+    #[test]
+    fn decodes_pre_epoch_float_datetime() {
+        // 1969-12-31 23:59:59.500 UTC
+        assert_decodes_near(-1, 500_000_000);
+        // 1969-12-31 23:59:58.750 UTC
+        assert_decodes_near(-2, 750_000_000);
+    }
+
+    // Post-epoch values were already correct; guard against a regression.
+    #[test]
+    fn decodes_post_epoch_float_datetime() {
+        // 1970-01-01 00:00:01.500 UTC
+        assert_decodes_near(1, 500_000_000);
     }
 }

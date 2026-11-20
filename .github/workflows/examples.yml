@@ -11,40 +11,41 @@ jobs:
   sqlx-cli:
     name: Build SQLx CLI
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
 
-      - uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: stable
-          override: true
+      - name: Setup Rust
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustup override set stable
 
-      - uses: Swatinem/rust-cache@v1
-        with:
-          key: sqlx-cli
+      - uses: Swatinem/rust-cache@v2
 
-      - uses: actions-rs/cargo@v1
-        with:
-          command: build
-          args: >
-            -p sqlx-cli
-            --bin sqlx
-            --release
-            --no-default-features
-            --features mysql,postgres,sqlite
-        env:
-          RUSTFLAGS: -D warnings
+      - run: >
+          cargo build
+          -p sqlx-cli
+          --release
+          --no-default-features
+          --features mysql,postgres,sqlite,sqlx-toml,mysql-rsa
 
-      - uses: actions/upload-artifact@v3
+      - uses: actions/upload-artifact@v4
         with:
           name: sqlx-cli
-          path: target/release/sqlx
+          path: |
+            target/release/sqlx
+            target/release/cargo-sqlx
 
   mysql:
     name: MySQL Examples
     runs-on: ubuntu-latest
     needs: sqlx-cli
+    timeout-minutes: 30
+
+    strategy:
+      matrix:
+        offline: ['', 'offline']
 
     services:
       mysql:
@@ -56,7 +57,7 @@ jobs:
 
     steps:
       - name: Get SQLx-CLI
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           name: sqlx-cli
           # $HOME is interpreted differently by the shell
@@ -64,21 +65,16 @@ jobs:
 
       - run: |
           ls -R /home/runner/.local/bin
-          chmod +x /home/runner/.local/bin/sqlx
+          chmod +x /home/runner/.local/bin/sqlx /home/runner/.local/bin/cargo-sqlx
           echo /home/runner/.local/bin >> $GITHUB_PATH
           sleep 10
 
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
 
-      - uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: stable
-          override: true
+      - name: Setup Rust
+        run: rustup show active-toolchain || rustup toolchain install
 
-      - uses: Swatinem/rust-cache@v1
-        with:
-          key: mysql-examples
+      - uses: Swatinem/rust-cache@v2
 
       - name: Todos (Setup)
         working-directory: examples/mysql/todos
@@ -86,19 +82,43 @@ jobs:
           DATABASE_URL: mysql://root:password@localhost:3306/todos?ssl-mode=disabled
         run: sqlx db setup
 
-      - name: Todos (Run)
-        uses: actions-rs/cargo@v1
+      - name: Todos (Prepare)
+        if: ${{ matrix.offline }}
+        working-directory: examples/mysql/todos
         env:
           DATABASE_URL: mysql://root:password@localhost:3306/todos?ssl-mode=disabled
-        with:
-          # TODO: test full CLI
-          command: run
-          args: -p sqlx-example-mysql-todos
+        run: cargo sqlx prepare
+
+      - name: Todos (Check Offline)
+        if: ${{ matrix.offline }}
+        run: |
+          cargo clean -p sqlx-example-mysql-todos
+          cargo check -p sqlx-example-mysql-todos
+
+      - name: Todos (Prepare from .env)
+        if: ${{ matrix.offline }}
+        working-directory: examples/mysql/todos
+        run: |
+          echo "DATABASE_URL=mysql://root:password@localhost:3306/todos?ssl-mode=disabled" > .env
+          cargo clean -p sqlx-example-mysql-todos
+          cargo sqlx prepare
+          rm .env
+
+      - name: Todos (Run)
+        env:
+          DATABASE_URL: mysql://root:password@localhost:3306/todos?ssl-mode=disabled
+          SQLX_OFFLINE: ${{ matrix.offline == 'offline' }}
+        run: cargo run -p sqlx-example-mysql-todos
 
   postgres:
     name: PostgreSQL Examples
     runs-on: ubuntu-latest
     needs: sqlx-cli
+    timeout-minutes: 30
+
+    strategy:
+      matrix:
+        offline: ['', 'offline']
 
     services:
       postgres:
@@ -110,28 +130,22 @@ jobs:
 
     steps:
       - name: Get SQLx-CLI
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           name: sqlx-cli
           path: /home/runner/.local/bin
 
-      - run:  |
+      - run: |
           ls -R /home/runner/.local/bin
           chmod +x $HOME/.local/bin/sqlx
+          chmod +x $HOME/.local/bin/cargo-sqlx
           echo $HOME/.local/bin >> $GITHUB_PATH
           sleep 10
 
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
 
-      - uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: stable
-          override: true
-
-      - uses: Swatinem/rust-cache@v1
-        with:
-          key: pg-examples
+      - name: Setup Rust
+        run: rustup show active-toolchain || rustup toolchain install
 
       - name: Axum Social with Tests (Setup)
         working-directory: examples/postgres/axum-social-with-tests
@@ -139,29 +153,38 @@ jobs:
           DATABASE_URL: postgres://postgres:password@localhost:5432/axum-social
         run: sqlx db setup
 
-      - name: Axum Social with Tests (Check)
-        uses: actions-rs/cargo@v1
+      # Test `cargo sqlx prepare` setting `DATABASE_URL` both directly and in `.env`
+      # This doesn't need to be done for every single example here, but should at least cover potential problem cases.
+      - name: Axum Social with Tests (Prepare)
+        if: ${{ matrix.offline }}
         env:
           DATABASE_URL: postgres://postgres:password@localhost:5432/axum-social
-        with:
-          command: check
-          args: -p sqlx-example-postgres-axum-social
+        run: cargo sqlx prepare -- -p sqlx-example-postgres-axum-social
+
+      - name: Axum Social with Tests (Check Offline)
+        if: ${{ matrix.offline }}
+        run: |
+          cargo clean -p sqlx-example-postgres-axum-social
+          cargo check -p sqlx-example-postgres-axum-social
+
+      - name: Axum Social with Tests (Prepare from .env)
+        if: ${{ matrix.offline }}
+        run: |
+          echo "DATABASE_URL=postgres://postgres:password@localhost:5432/axum-social" > .env
+          cargo clean -p sqlx-example-postgres-axum-social
+          cargo sqlx prepare -- -p sqlx-example-postgres-axum-social
+          rm .env
 
       - name: Axum Social with Tests (Test)
-        uses: actions-rs/cargo@v1
         env:
           DATABASE_URL: postgres://postgres:password@localhost:5432/axum-social
-        with:
-          command: test
-          args: -p sqlx-example-postgres-axum-social
+          SQLX_OFFLINE: ${{ matrix.offline == 'offline' }}
+        run: cargo test -p sqlx-example-postgres-axum-social
 
       # The Chat example has an interactive TUI which is not trivial to test automatically,
       # so we only check that it compiles.
       - name: Chat (Check)
-        uses: actions-rs/cargo@v1
-        with:
-          command: check
-          args: -p sqlx-example-postgres-chat
+        run: cargo check -p sqlx-example-postgres-chat
 
       - name: Files (Setup)
         working-directory: examples/postgres/files
@@ -170,12 +193,9 @@ jobs:
         run: sqlx db setup
 
       - name: Files (Run)
-        uses: actions-rs/cargo@v1
         env:
           DATABASE_URL: postgres://postgres:password@localhost:5432/files
-        with:
-          command: run
-          args: -p sqlx-example-postgres-files
+        run: cargo run -p sqlx-example-postgres-files
 
       - name: JSON (Setup)
         working-directory: examples/postgres/json
@@ -184,12 +204,9 @@ jobs:
         run: sqlx db setup
 
       - name: JSON (Run)
-        uses: actions-rs/cargo@v1
         env:
           DATABASE_URL: postgres://postgres:password@localhost:5432/json
-        with:
-          command: run
-          args: -p sqlx-example-postgres-json
+        run: cargo run -p sqlx-example-postgres-json
 
       - name: Listen (Setup)
         working-directory: examples/postgres/listen
@@ -198,12 +215,9 @@ jobs:
         run: sqlx db create
 
       - name: Listen (Run)
-        uses: actions-rs/cargo@v1
         env:
           DATABASE_URL: postgres://postgres:password@localhost:5432/listen
-        with:
-          command: run
-          args: -p sqlx-example-postgres-listen
+        run: cargo run -p sqlx-example-postgres-listen
 
       - name: Mockable TODOs (Setup)
         working-directory: examples/postgres/mockable-todos
@@ -212,13 +226,117 @@ jobs:
         run: sqlx db setup
 
       - name: Mockable TODOs (Run)
-        uses: actions-rs/cargo@v1
         env:
           DATABASE_URL: postgres://postgres:password@localhost:5432/mockable-todos
-        with:
-          # TODO: test full CLI
-          command: run
-          args: -p sqlx-example-postgres-mockable-todos
+        run: cargo run -p sqlx-example-postgres-mockable-todos
+
+      - name: Multi-Database (Setup)
+        working-directory: examples/postgres/multi-database
+        env:
+          DATABASE_URL: postgres://postgres:password@localhost:5432/multi-database
+          ACCOUNTS_DATABASE_URL: postgres://postgres:password@localhost:5432/multi-database-accounts
+          PAYMENTS_DATABASE_URL: postgres://postgres:password@localhost:5432/multi-database-payments
+        run: |
+          (cd accounts && sqlx db setup)
+          (cd payments && sqlx db setup)
+          sqlx db setup
+
+      - name: Multi-Database (Prepare)
+        if: ${{ matrix.offline }}
+        env:
+          DATABASE_URL: postgres://postgres:password@localhost:5432/multi-database
+          ACCOUNTS_DATABASE_URL: postgres://postgres:password@localhost:5432/multi-database-accounts
+          PAYMENTS_DATABASE_URL: postgres://postgres:password@localhost:5432/multi-database-payments
+        run: |
+            cargo clean -p sqlx-example-postgres-multi-database-accounts
+            cargo clean -p sqlx-example-postgres-multi-database-payments
+            cargo clean -p sqlx-example-postgres-multi-database
+            # should include -accounts and -payments
+            cargo sqlx prepare -- -p sqlx-example-postgres-multi-database
+
+      - name: Multi-Database (Check Offline)
+        if: ${{ matrix.offline }}
+        run: |
+          cargo clean -p sqlx-example-postgres-multi-database
+          cargo check -p sqlx-example-postgres-multi-database
+
+      - name: Multi-Database (Prepare from .env)
+        if: ${{ matrix.offline }}
+        run: |
+          # Tried to get this to work with heredocs but had trouble writing tabs in YAML
+          echo 'DATABASE_URL=postgres://postgres:password@localhost:5432/multi-database' >.env
+          # Important: append, don't truncate
+          echo 'ACCOUNTS_DATABASE_URL=postgres://postgres:password@localhost:5432/multi-database-accounts' >> .env
+          echo 'PAYMENTS_DATABASE_URL=postgres://postgres:password@localhost:5432/multi-database-payments' >> .env
+          
+          cargo clean -p sqlx-example-postgres-multi-database-accounts
+          cargo clean -p sqlx-example-postgres-multi-database-payments
+          cargo clean -p sqlx-example-postgres-multi-database
+          cargo sqlx prepare -- -p sqlx-example-postgres-multi-database
+          
+          rm .env
+
+      - name: Multi-Database (Run)
+        env:
+          DATABASE_URL: postgres://postgres:password@localhost:5432/multi-database
+          ACCOUNTS_DATABASE_URL: postgres://postgres:password@localhost:5432/multi-database-accounts
+          PAYMENTS_DATABASE_URL: postgres://postgres:password@localhost:5432/multi-database-payments
+          SQLX_OFFLINE: ${{ matrix.offline == 'offline' }}
+        run: cargo run -p sqlx-example-postgres-multi-database
+
+      - name: Multi-Tenant (Setup)
+        working-directory: examples/postgres/multi-tenant
+        env:
+          DATABASE_URL: postgres://postgres:password@localhost:5432/multi-tenant
+        run: |
+          (cd accounts && sqlx db setup)
+          (cd payments && sqlx migrate run)
+          sqlx migrate run
+
+      - name: Multi-Tenant (Prepare)
+        if: ${{ matrix.offline }}
+        env:
+          DATABASE_URL: postgres://postgres:password@localhost:5432/multi-tenant
+        run: |
+          cargo clean -p sqlx-example-postgres-multi-tenant-accounts
+          cargo clean -p sqlx-example-postgres-multi-tenant-payments
+          cargo clean -p sqlx-example-postgres-multi-tenant
+          # should include -accounts and -payments
+          cargo sqlx prepare -- -p sqlx-example-postgres-multi-tenant
+
+      - name: Multi-Tenant (Check Offline)
+        if: ${{ matrix.offline }}
+        run: cargo check -p sqlx-example-postgres-multi-tenant
+
+      - name: Multi-Tenant (Prepare from .env)
+        if: ${{ matrix.offline }}
+        run: |
+          echo "DATABASE_URL=postgres://postgres:password@localhost:5432/multi-tenant" > .env
+          
+          cargo clean -p sqlx-example-postgres-multi-tenant-accounts
+          cargo clean -p sqlx-example-postgres-multi-tenant-payments
+          cargo clean -p sqlx-example-postgres-multi-tenant
+          # should include -accounts and -payments
+          cargo sqlx prepare -- -p sqlx-example-postgres-multi-tenant
+          
+          rm .env
+
+      - name: Multi-Tenant (Run)
+        env:
+          DATABASE_URL: postgres://postgres:password@localhost:5432/multi-tenant
+          SQLX_OFFLINE: ${{ matrix.offline == 'offline' }}
+        run: cargo run -p sqlx-example-postgres-multi-tenant
+
+      - name: Preferred-Crates (Setup)
+        working-directory: examples/postgres/preferred-crates
+        env:
+          DATABASE_URL: postgres://postgres:password@localhost:5432/preferred-crates
+        run: sqlx db setup
+
+      - name: Preferred-Crates (Run)
+        env:
+          DATABASE_URL: postgres://postgres:password@localhost:5432/preferred-crates
+        run: cargo run -p sqlx-example-postgres-preferred-crates
 
       - name: TODOs (Setup)
         working-directory: examples/postgres/todos
@@ -227,13 +345,10 @@ jobs:
         run: sqlx db setup
 
       - name: TODOs (Run)
-        uses: actions-rs/cargo@v1
         env:
           DATABASE_URL: postgres://postgres:password@localhost:5432/todos
-        with:
-          # TODO: test full CLI
-          command: run
-          args: -p sqlx-example-postgres-todos
+        # TODO: test full CLI
+        run: cargo run -p sqlx-example-postgres-todos
 
       - name: Transaction (Setup)
         working-directory: examples/postgres/transaction
@@ -242,21 +357,19 @@ jobs:
         run: sqlx db setup
 
       - name: Transaction (Run)
-        uses: actions-rs/cargo@v1
         env:
           DATABASE_URL: postgres://postgres:password@localhost:5432/txn
-        with:
-          command: run
-          args: -p sqlx-example-postgres-transaction
+        run: cargo run -p sqlx-example-postgres-transaction
 
   sqlite:
     name: SQLite Examples
     runs-on: ubuntu-latest
     needs: sqlx-cli
+    timeout-minutes: 30
 
     steps:
       - name: Get SQLx-CLI
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           name: sqlx-cli
           path: /home/runner/.local/bin
@@ -266,27 +379,40 @@ jobs:
           chmod +x /home/runner/.local/bin/sqlx
           echo /home/runner/.local/bin >> $GITHUB_PATH
 
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
 
-      - uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: stable
-          override: true
+      - name: Setup Rust
+        run: rustup show active-toolchain || rustup toolchain install
 
-      - uses: Swatinem/rust-cache@v1
-        with:
-          key: sqlite-examples
+      - uses: Swatinem/rust-cache@v2
 
       - name: TODOs (Setup)
         env:
           DATABASE_URL: sqlite://todos.sqlite
         run: sqlx db setup --source=examples/sqlite/todos/migrations
 
-      - name: TODOs (Run)
-        uses: actions-rs/cargo@v1
+      - name: Todos (Prepare)
+        if: ${{ matrix.offline }}
         env:
           DATABASE_URL: sqlite://todos.sqlite
-        with:
-          command: run
-          args: -p sqlx-example-sqlite-todos
+        run: cargo sqlx prepare -- -p sqlx-example-sqlite-todos
+
+      - name: Todos (Check Offline)
+        if: ${{ matrix.offline }}
+        run: |
+          cargo clean -p sqlx-example-sqlite-todos
+          cargo check -p sqlx-example-sqlite-todos
+
+      - name: Todos (Prepare from .env)
+        if: ${{ matrix.offline }}
+        run: |
+          echo "DATABASE_URL=sqlite://todos.sqlite" > .env
+          cargo clean -p sqlx-example-sqlite-todos
+          cargo sqlx prepare -- -p sqlx-example-sqlite-todos
+          rm .env
+
+      - name: TODOs (Run)
+        env:
+          DATABASE_URL: sqlite://todos.sqlite
+          SQLX_OFFLINE: ${{ matrix.offline == 'offline' }}
+        run: cargo run -p sqlx-example-sqlite-todos

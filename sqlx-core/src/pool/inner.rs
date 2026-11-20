@@ -9,15 +9,18 @@ use crossbeam_queue::ArrayQueue;
 use crate::sync::{AsyncSemaphore, AsyncSemaphoreReleaser};
 
 use std::cmp;
-use std::future::Future;
+use std::future::{self, Future};
+use std::pin::pin;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::task::Poll;
 
+use crate::logger::private_level_filter_to_trace_level;
 use crate::pool::options::PoolConnectionMetadata;
-use futures_util::future::{self};
+use crate::private_tracing_dynamic_event;
 use futures_util::FutureExt;
 use std::time::{Duration, Instant};
+use tracing::Level;
 
 pub(crate) struct PoolInner<DB: Database> {
     pub(super) connect_options: RwLock<Arc<<DB::Connection as Connection>::Options>>,
@@ -28,6 +31,8 @@ pub(crate) struct PoolInner<DB: Database> {
     is_closed: AtomicBool,
     pub(super) on_closed: event_listener::Event,
     pub(super) options: PoolOptions<DB>,
+    pub(crate) acquire_time_level: Option<Level>,
+    pub(crate) acquire_slow_level: Option<Level>,
 }
 
 impl<DB: Database> PoolInner<DB> {
@@ -54,6 +59,8 @@ impl<DB: Database> PoolInner<DB> {
             num_idle: AtomicUsize::new(0),
             is_closed: AtomicBool::new(false),
             on_closed: event_listener::Event::new(),
+            acquire_time_level: private_level_filter_to_trace_level(options.acquire_time_level),
+            acquire_slow_level: private_level_filter_to_trace_level(options.acquire_slow_level),
             options,
         };
 
@@ -86,23 +93,28 @@ impl<DB: Database> PoolInner<DB> {
         self.on_closed.notify(usize::MAX);
     }
 
-    pub(super) fn close<'a>(self: &'a Arc<Self>) -> impl Future<Output = ()> + 'a {
+    pub(super) fn close(self: &Arc<Self>) -> impl Future<Output = ()> + '_ {
         self.mark_closed();
 
         async move {
-            for permits in 1..=self.options.max_connections {
-                // Close any currently idle connections in the pool.
-                while let Some(idle) = self.idle_conns.pop() {
-                    let _ = idle.live.float((*self).clone()).close().await;
-                }
+            // For child pools, we need to acquire permits we actually have rather than
+            // max_connections
+            let permits_to_acquire = if self.options.parent_pool.is_some() {
+                // Child pools start with 0 permits, so we acquire based on current size
+                self.size()
+            } else {
+                // Parent pools can acquire all max_connections permits
+                self.options.max_connections
+            };
 
-                if self.size() == 0 {
-                    break;
-                }
+            let _permits = self.semaphore.acquire(permits_to_acquire).await;
 
-                // Wait for all permits to be released.
-                let _permits = self.semaphore.acquire(permits).await;
+            while let Some(idle) = self.idle_conns.pop() {
+                let _ = idle.live.raw.close().await;
             }
+
+            self.num_idle.store(0, Ordering::Release);
+            self.size.store(0, Ordering::Release);
         }
     }
 
@@ -116,26 +128,19 @@ impl<DB: Database> PoolInner<DB> {
     ///
     /// If we steal a permit from the parent but *don't* open a connection,
     /// it should be returned to the parent.
-    async fn acquire_permit<'a>(self: &'a Arc<Self>) -> Result<AsyncSemaphoreReleaser<'a>, Error> {
+    async fn acquire_permit(self: &Arc<Self>) -> Result<AsyncSemaphoreReleaser<'_>, Error> {
         let parent = self
             .parent()
             // If we're already at the max size, we shouldn't try to steal from the parent.
             // This is just going to cause unnecessary churn in `acquire()`.
             .filter(|_| self.size() < self.options.max_connections);
 
-        let acquire_self = self.semaphore.acquire(1).fuse();
-        let mut close_event = self.close_event();
+        let mut acquire_self = pin!(self.semaphore.acquire(1).fuse());
+        let mut close_event = pin!(self.close_event());
 
         if let Some(parent) = parent {
-            let acquire_parent = parent.0.semaphore.acquire(1);
-            let parent_close_event = parent.0.close_event();
-
-            futures_util::pin_mut!(
-                acquire_parent,
-                acquire_self,
-                close_event,
-                parent_close_event
-            );
+            let mut acquire_parent = pin!(parent.0.semaphore.acquire(1));
+            let mut parent_close_event = pin!(parent.0.close_event());
 
             let mut poll_parent = false;
 
@@ -146,7 +151,7 @@ impl<DB: Database> PoolInner<DB> {
 
                 if parent_close_event.as_mut().poll(cx).is_ready() {
                     // Propagate the parent's close event to the child.
-                    let _ = self.close();
+                    self.mark_closed();
                     return Poll::Ready(Err(Error::PoolClosed));
                 }
 
@@ -189,7 +194,14 @@ impl<DB: Database> PoolInner<DB> {
         permit: AsyncSemaphoreReleaser<'a>,
     ) -> Result<Floating<DB, Idle<DB>>, AsyncSemaphoreReleaser<'a>> {
         if let Some(idle) = self.idle_conns.pop() {
-            self.num_idle.fetch_sub(1, Ordering::AcqRel);
+            // Saturating: never underflow even if a concurrent `release` hasn't yet published
+            // its increment. An underflow would wrap `num_idle` to `usize::MAX` and wedge the
+            // maintenance task in a non-yielding spin (see `release` for the full invariant).
+            let _ = self
+                .num_idle
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                    Some(n.saturating_sub(1))
+                });
             Ok(Floating::from_idle(idle, (*self).clone(), permit))
         } else {
             Err(permit)
@@ -197,19 +209,25 @@ impl<DB: Database> PoolInner<DB> {
     }
 
     pub(super) fn release(&self, floating: Floating<DB, Live<DB>>) {
-        // `options.after_release` is invoked by `PoolConnection::release_to_pool()`.
+        // `options.after_release` and other checks are in `PoolConnection::return_to_pool()`.
 
         let Floating { inner: idle, guard } = floating.into_idle();
 
-        if !self.idle_conns.push(idle).is_ok() {
+        // Bump the idle counter *before* the connection becomes acquirable, so a concurrent
+        // `pop_idle` can never observe a popped connection without a matching increment.
+        // (Otherwise `num_idle.fetch_sub` can underflow a `usize` to `usize::MAX`, which makes
+        // the maintenance task's `for _ in 0..num_idle()` loop spin ~forever, pegging a CPU.)
+        // Over-counting transiently (incremented, not yet pushed) is harmless: `pop_idle`
+        // simply finds an empty queue and returns the permit without decrementing.
+        self.num_idle.fetch_add(1, Ordering::AcqRel);
+
+        if self.idle_conns.push(idle).is_err() {
             panic!("BUG: connection queue overflow in release()");
         }
 
         // NOTE: we need to make sure we drop the permit *after* we push to the idle queue
         // don't decrease the size
         guard.release_permit();
-
-        self.num_idle.fetch_add(1, Ordering::AcqRel);
     }
 
     /// Try to atomically increment the pool size for a new connection.
@@ -219,7 +237,7 @@ impl<DB: Database> PoolInner<DB> {
         self: &'a Arc<Self>,
         permit: AsyncSemaphoreReleaser<'a>,
     ) -> Result<DecrementSizeGuard<DB>, AsyncSemaphoreReleaser<'a>> {
-        match self
+        let result = self
             .size
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |size| {
                 if self.is_closed() {
@@ -228,7 +246,9 @@ impl<DB: Database> PoolInner<DB> {
 
                 size.checked_add(1)
                     .filter(|size| size <= &self.options.max_connections)
-            }) {
+            });
+
+        match result {
             // we successfully incremented the size
             Ok(_) => Ok(DecrementSizeGuard::from_permit((*self).clone(), permit)),
             // the pool is at max capacity or is closed
@@ -241,15 +261,23 @@ impl<DB: Database> PoolInner<DB> {
             return Err(Error::PoolClosed);
         }
 
-        let deadline = Instant::now() + self.options.acquire_timeout;
+        let acquire_started_at = Instant::now();
+        let deadline = acquire_started_at + self.options.acquire_timeout;
 
-        crate::rt::timeout(
+        let acquired = crate::rt::timeout(
             self.options.acquire_timeout,
             async {
                 loop {
                     // Handles the close-event internally
                     let permit = self.acquire_permit().await?;
 
+                    // Nothing idle, but a connection exists: it may be on its way back,
+                    // in a `return_to_pool()` task spawned when it was dropped. On a
+                    // current-thread runtime that task cannot run before we yield, and we
+                    // would open a new connection for every sequential query.
+                    if self.num_idle() == 0 && self.size() > 0 {
+                        crate::rt::yield_now().await;
+                    }
 
                     // First attempt to pop a connection from the idle queue.
                     let guard = match self.pop_idle(permit) {
@@ -272,8 +300,8 @@ impl<DB: Database> PoolInner<DB> {
                             // or if the pool was closed between `acquire_permit()` and
                             // `try_increment_size()`.
                             tracing::debug!("woke but was unable to acquire idle connection or open new one; retrying");
-                            // If so, we're likely in the current-thread runtime if it's Tokio
-                            // and so we should yield to let any spawned release_to_pool() tasks
+                            // If so, we're likely in the current-thread runtime if it's Tokio,
+                            // and so we should yield to let any spawned return_to_pool() tasks
                             // execute.
                             crate::rt::yield_now().await;
                             continue;
@@ -286,7 +314,32 @@ impl<DB: Database> PoolInner<DB> {
             }
         )
             .await
-            .map_err(|_| Error::PoolTimedOut)?
+            .map_err(|_| Error::PoolTimedOut)??;
+
+        let acquired_after = acquire_started_at.elapsed();
+
+        let acquire_slow_level = self
+            .acquire_slow_level
+            .filter(|_| acquired_after > self.options.acquire_slow_threshold);
+
+        if let Some(level) = acquire_slow_level {
+            private_tracing_dynamic_event!(
+                target: "sqlx::pool::acquire",
+                level,
+                acquired_after_secs = acquired_after.as_secs_f64(),
+                slow_acquire_threshold_secs = self.options.acquire_slow_threshold.as_secs_f64(),
+                "acquired connection, but time to acquire exceeded slow threshold"
+            );
+        } else if let Some(level) = self.acquire_time_level {
+            private_tracing_dynamic_event!(
+                target: "sqlx::pool::acquire",
+                level,
+                acquired_after_secs = acquired_after.as_secs_f64(),
+                "acquired connection"
+            );
+        }
+
+        Ok(acquired)
     }
 
     pub(super) async fn connect(
@@ -299,10 +352,10 @@ impl<DB: Database> PoolInner<DB> {
         }
 
         let mut backoff = Duration::from_millis(10);
-        let max_backoff = deadline_as_timeout::<DB>(deadline)? / 5;
+        let max_backoff = deadline_as_timeout(deadline)? / 5;
 
         loop {
-            let timeout = deadline_as_timeout::<DB>(deadline)?;
+            let timeout = deadline_as_timeout(deadline)?;
 
             // clone the connect options arc so it can be used without holding the RwLockReadGuard
             // across an async await point
@@ -417,29 +470,26 @@ impl<DB: Database> Drop for PoolInner<DB> {
 }
 
 /// Returns `true` if the connection has exceeded `options.max_lifetime` if set, `false` otherwise.
-fn is_beyond_max_lifetime<DB: Database>(live: &Live<DB>, options: &PoolOptions<DB>) -> bool {
+pub(super) fn is_beyond_max_lifetime<DB: Database>(
+    live: &Live<DB>,
+    options: &PoolOptions<DB>,
+) -> bool {
     options
         .max_lifetime
-        .map_or(false, |max| live.created_at.elapsed() > max)
+        .is_some_and(|max| live.created_at.elapsed() > max)
 }
 
 /// Returns `true` if the connection has exceeded `options.idle_timeout` if set, `false` otherwise.
 fn is_beyond_idle_timeout<DB: Database>(idle: &Idle<DB>, options: &PoolOptions<DB>) -> bool {
     options
         .idle_timeout
-        .map_or(false, |timeout| idle.idle_since.elapsed() > timeout)
+        .is_some_and(|timeout| idle.idle_since.elapsed() > timeout)
 }
 
 async fn check_idle_conn<DB: Database>(
     mut conn: Floating<DB, Idle<DB>>,
     options: &PoolOptions<DB>,
 ) -> Result<Floating<DB, Live<DB>>, DecrementSizeGuard<DB>> {
-    // If the connection we pulled has expired, close the connection and
-    // immediately create a new connection
-    if is_beyond_max_lifetime(&conn, options) {
-        return Err(conn.close().await);
-    }
-
     if options.test_before_acquire {
         // Check that the connection is still live
         if let Err(error) = conn.ping().await {
@@ -475,9 +525,9 @@ async fn check_idle_conn<DB: Database>(
 }
 
 fn spawn_maintenance_tasks<DB: Database>(pool: &Arc<PoolInner<DB>>) {
-    // NOTE: use `pool_weak` for the maintenance tasks so
-    // they don't keep `PoolInner` from being dropped.
-    let pool_weak = Arc::downgrade(&pool);
+    // NOTE: use `pool_weak` for the maintenance tasks
+    // so they don't keep `PoolInner` from being dropped.
+    let pool_weak = Arc::downgrade(pool);
 
     let period = match (pool.options.max_lifetime, pool.options.idle_timeout) {
         (Some(it), None) | (None, Some(it)) => it,
@@ -503,22 +553,35 @@ fn spawn_maintenance_tasks<DB: Database>(pool: &Arc<PoolInner<DB>>) {
     crate::rt::spawn(async move {
         let _ = close_event
             .do_until(async {
-                let mut slept = true;
-
                 // If the last handle to the pool was dropped while we were sleeping
                 while let Some(pool) = pool_weak.upgrade() {
                     if pool.is_closed() {
                         return;
                     }
 
-                    // Don't run the reaper right away.
-                    if slept && !pool.idle_conns.is_empty() {
-                        do_reap(&pool).await;
-                    }
-
                     let next_run = Instant::now() + period;
 
-                    pool.min_connections_maintenance(Some(next_run)).await;
+                    // Go over all idle connections, check for idleness and lifetime,
+                    // and if we have fewer than min_connections after reaping a connection,
+                    // open a new one immediately. Note that other connections may be popped from
+                    // the queue in the meantime - that's fine, there is no harm in checking more.
+                    //
+                    // Cap the iteration count at `max_connections` so that even a corrupt
+                    // `num_idle` (e.g. an underflow to `usize::MAX`) can never make this
+                    // synchronous, non-yielding loop spin unboundedly and starve the runtime.
+                    let checks = cmp::min(pool.num_idle(), pool.options.max_connections as usize);
+                    for _ in 0..checks {
+                        if let Some(conn) = pool.try_acquire() {
+                            if is_beyond_idle_timeout(&conn, &pool.options)
+                                || is_beyond_max_lifetime(&conn, &pool.options)
+                            {
+                                let _ = conn.close().await;
+                                pool.min_connections_maintenance(Some(next_run)).await;
+                            } else {
+                                pool.release(conn.into_live());
+                            }
+                        }
+                    }
 
                     // Don't hold a reference to the pool while sleeping.
                     drop(pool);
@@ -530,35 +593,10 @@ fn spawn_maintenance_tasks<DB: Database>(pool: &Arc<PoolInner<DB>>) {
                         // `next_run` is in the past, just yield.
                         crate::rt::yield_now().await;
                     }
-
-                    slept = true;
                 }
             })
             .await;
     });
-}
-
-async fn do_reap<DB: Database>(pool: &Arc<PoolInner<DB>>) {
-    // reap at most the current size minus the minimum idle
-    let max_reaped = pool.size().saturating_sub(pool.options.min_connections);
-
-    // collect connections to reap
-    let (reap, keep) = (0..max_reaped)
-        // only connections waiting in the queue
-        .filter_map(|_| pool.try_acquire())
-        .partition::<Vec<_>, _>(|conn| {
-            is_beyond_idle_timeout(conn, &pool.options)
-                || is_beyond_max_lifetime(conn, &pool.options)
-        });
-
-    for conn in keep {
-        // return valid connections to the pool first
-        pool.release(conn.into_live());
-    }
-
-    for conn in reap {
-        let _ = conn.close().await;
-    }
 }
 
 /// RAII guard returned by `Pool::try_increment_size()` and others.
@@ -606,5 +644,181 @@ impl<DB: Database> Drop for DecrementSizeGuard<DB> {
             // and here we release the permit we got on construction
             self.pool.semaphore.release(1);
         }
+    }
+}
+
+// Uses the in-crate `Any` database with a stub backend so we can drive `PoolInner` internals
+// directly. (We can't use a real driver here: the only `Database` impls outside this crate
+// would be a different `sqlx-core` instance via the dev-dependency cycle.)
+#[cfg(all(test, feature = "any"))]
+mod underflow_tests {
+    use super::*;
+    use crate::any::{
+        Any, AnyArguments, AnyConnectOptions, AnyConnection, AnyConnectionBackend, AnyQueryResult,
+        AnyRow, AnyStatement, AnyTypeInfo,
+    };
+    use crate::pool::Pool;
+    use crate::sql_str::SqlStr;
+    use either::Either;
+    use futures_core::future::BoxFuture;
+    use futures_core::stream::BoxStream;
+    use std::str::FromStr;
+
+    /// A backend that constructs but never executes anything. The pool's `release`/`pop_idle`
+    /// paths only move the opaque connection around — they never call any of these methods.
+    #[derive(Debug)]
+    struct StubBackend;
+
+    impl AnyConnectionBackend for StubBackend {
+        fn name(&self) -> &str {
+            "stub"
+        }
+        fn close(self: Box<Self>) -> BoxFuture<'static, crate::Result<()>> {
+            unimplemented!()
+        }
+        fn close_hard(self: Box<Self>) -> BoxFuture<'static, crate::Result<()>> {
+            unimplemented!()
+        }
+        fn ping(&mut self) -> BoxFuture<'_, crate::Result<()>> {
+            unimplemented!()
+        }
+        fn begin(&mut self, _statement: Option<SqlStr>) -> BoxFuture<'_, crate::Result<()>> {
+            unimplemented!()
+        }
+        fn commit(&mut self) -> BoxFuture<'_, crate::Result<()>> {
+            unimplemented!()
+        }
+        fn rollback(&mut self) -> BoxFuture<'_, crate::Result<()>> {
+            unimplemented!()
+        }
+        fn start_rollback(&mut self) {
+            unimplemented!()
+        }
+        fn shrink_buffers(&mut self) {
+            unimplemented!()
+        }
+        fn flush(&mut self) -> BoxFuture<'_, crate::Result<()>> {
+            unimplemented!()
+        }
+        fn should_flush(&self) -> bool {
+            unimplemented!()
+        }
+        fn fetch_many(
+            &mut self,
+            _query: SqlStr,
+            _persistent: bool,
+            _arguments: Option<AnyArguments>,
+        ) -> BoxStream<'_, crate::Result<Either<AnyQueryResult, AnyRow>>> {
+            unimplemented!()
+        }
+        fn fetch_optional(
+            &mut self,
+            _query: SqlStr,
+            _persistent: bool,
+            _arguments: Option<AnyArguments>,
+        ) -> BoxFuture<'_, crate::Result<Option<AnyRow>>> {
+            unimplemented!()
+        }
+        fn prepare_with<'c, 'q: 'c>(
+            &'c mut self,
+            _sql: SqlStr,
+            _parameters: &[AnyTypeInfo],
+        ) -> BoxFuture<'c, crate::Result<AnyStatement>> {
+            unimplemented!()
+        }
+        #[cfg(feature = "offline")]
+        fn describe(
+            &mut self,
+            _sql: SqlStr,
+        ) -> BoxFuture<'_, crate::Result<crate::describe::Describe<Any>>> {
+            unimplemented!()
+        }
+    }
+
+    fn make_live(inner: &Arc<PoolInner<Any>>) -> Floating<Any, Live<Any>> {
+        // Mint a live connection like `acquire` would: take a size slot + a permit, wrap a
+        // stub connection. The pool's `release`/`try_acquire` never touch the connection
+        // itself, so a stub backend that panics on use is fine.
+        inner.size.fetch_add(1, Ordering::AcqRel);
+        let permit = inner
+            .semaphore
+            .try_acquire(1)
+            .expect("a permit should be available");
+        let guard = DecrementSizeGuard::from_permit(Arc::clone(inner), permit);
+        let conn = AnyConnection {
+            backend: Box::new(StubBackend),
+        };
+        Floating::new_live(conn, guard)
+    }
+
+    // Stress test for the `num_idle` underflow race, exercised entirely through the real
+    // `try_acquire` and `release` paths.
+    //
+    // The bug: `release` published a returned connection (push to the idle queue + release its
+    // semaphore permit) *before* incrementing `num_idle`. A concurrent `try_acquire` could pop
+    // that connection and run its `pop_idle` decrement while `num_idle` was still 0, wrapping
+    // the `usize` to `usize::MAX`. Downstream, the maintenance task's `for _ in 0..num_idle()`
+    // sweep would then spin ~forever on a synchronous body, pinning a worker thread (the
+    // reported 100%-CPU-on-shutdown symptom).
+    //
+    // Many threads hammer acquire+release on a small, heavily oversubscribed pool, so the idle
+    // count is constantly driven to 0 right as another thread is publishing a connection —
+    // exactly the interleaving that underflows. Every thread samples `num_idle()` after each
+    // op and records the largest value ever seen; an underflow shows up as a value far above
+    // `max_connections`. This requires real OS threads: the race window in `release` has no
+    // `.await`, so it cannot interleave on a single-threaded executor.
+    #[test]
+    fn release_try_acquire_stress_never_underflows_num_idle() {
+        use std::sync::atomic::AtomicUsize;
+        use std::thread;
+
+        const MAX_CONNS: u32 = 3;
+        const WORKERS: usize = 12;
+        const ITERS: usize = 200_000;
+
+        let opts = AnyConnectOptions::from_str("stub::memory:").expect("parse url");
+        let pool: Pool<Any> = PoolOptions::new()
+            .max_connections(MAX_CONNS)
+            .min_connections(0)
+            .connect_lazy_with(opts);
+        let inner = Arc::clone(&pool.0);
+
+        // Pre-fill the pool with `MAX_CONNS` idle connections via the real `release` path.
+        for _ in 0..MAX_CONNS {
+            inner.release(make_live(&inner));
+        }
+        assert_eq!(inner.num_idle(), MAX_CONNS as usize);
+
+        // Sticky high-water mark of `num_idle` observed across all threads. A wrapped
+        // (underflowed) read is `usize::MAX`, far above `MAX_CONNS`.
+        let max_seen = Arc::new(AtomicUsize::new(0));
+
+        let mut handles = Vec::new();
+        for _ in 0..WORKERS {
+            let inner = Arc::clone(&inner);
+            let max_seen = Arc::clone(&max_seen);
+            handles.push(thread::spawn(move || {
+                for _ in 0..ITERS {
+                    // Real acquire/release cycle, racing the other threads.
+                    if let Some(idle) = inner.try_acquire() {
+                        inner.release(idle.into_live());
+                    }
+                    max_seen.fetch_max(inner.num_idle(), Ordering::Relaxed);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("worker thread panicked");
+        }
+
+        let observed = max_seen.load(Ordering::Relaxed);
+        assert!(
+            observed <= MAX_CONNS as usize,
+            "num_idle exceeded max_connections (saw {observed}, max {MAX_CONNS}); \
+             this indicates a `num_idle` underflow"
+        );
+
+        // Drain so the stub connections' size slots are released before the pool drops.
+        while inner.try_acquire().is_some() {}
     }
 }

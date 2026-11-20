@@ -1,22 +1,23 @@
-use std::marker::PhantomData;
+use std::{future, marker::PhantomData};
 
 use either::Either;
 use futures_core::stream::BoxStream;
-use futures_util::{future, StreamExt, TryFutureExt, TryStreamExt};
+use futures_util::{StreamExt, TryFutureExt, TryStreamExt};
 
 use crate::arguments::{Arguments, IntoArguments};
-use crate::database::{Database, HasArguments, HasStatement, HasStatementCache};
+use crate::database::{Database, HasStatementCache};
 use crate::encode::Encode;
-use crate::error::Error;
+use crate::error::{BoxDynError, Error};
 use crate::executor::{Execute, Executor};
+use crate::sql_str::{SqlSafeStr, SqlStr};
 use crate::statement::Statement;
 use crate::types::Type;
 
 /// A single SQL query as a prepared statement. Returned by [`query()`].
 #[must_use = "query must be executed to affect database"]
 pub struct Query<'q, DB: Database, A> {
-    pub(crate) statement: Either<&'q str, &'q <DB as HasStatement<'q>>::Statement>,
-    pub(crate) arguments: Option<A>,
+    pub(crate) statement: Either<SqlStr, &'q DB::Statement>,
+    pub(crate) arguments: Option<Result<A, BoxDynError>>,
     pub(crate) database: PhantomData<DB>,
     pub(crate) persistent: bool,
 }
@@ -41,26 +42,29 @@ pub struct Map<'q, DB: Database, F, A> {
 impl<'q, DB, A> Execute<'q, DB> for Query<'q, DB, A>
 where
     DB: Database,
-    A: Send + IntoArguments<'q, DB>,
+    A: Send + IntoArguments<DB>,
 {
     #[inline]
-    fn sql(&self) -> &'q str {
+    fn sql(self) -> SqlStr {
         match self.statement {
-            Either::Right(ref statement) => statement.sql(),
+            Either::Right(statement) => statement.sql().clone(),
             Either::Left(sql) => sql,
         }
     }
 
-    fn statement(&self) -> Option<&<DB as HasStatement<'q>>::Statement> {
+    fn statement(&self) -> Option<&DB::Statement> {
         match self.statement {
-            Either::Right(ref statement) => Some(&statement),
+            Either::Right(statement) => Some(statement),
             Either::Left(_) => None,
         }
     }
 
     #[inline]
-    fn take_arguments(&mut self) -> Option<<DB as HasArguments<'q>>::Arguments> {
-        self.arguments.take().map(IntoArguments::into_arguments)
+    fn take_arguments(&mut self) -> Result<Option<<DB as Database>::Arguments>, BoxDynError> {
+        self.arguments
+            .take()
+            .transpose()
+            .map(|option| option.map(IntoArguments::into_arguments))
     }
 
     #[inline]
@@ -69,7 +73,7 @@ where
     }
 }
 
-impl<'q, DB: Database> Query<'q, DB, <DB as HasArguments<'q>>::Arguments> {
+impl<DB: Database> Query<'_, DB, <DB as Database>::Arguments> {
     /// Bind a value for use with this SQL query.
     ///
     /// If the number of times this is called does not match the number of bind parameters that
@@ -78,16 +82,46 @@ impl<'q, DB: Database> Query<'q, DB, <DB as HasArguments<'q>>::Arguments> {
     ///
     /// There is no validation that the value is of the type expected by the query. Most SQL
     /// flavors will perform type coercion (Postgres will return a database error).
-    pub fn bind<T: 'q + Send + Encode<'q, DB> + Type<DB>>(mut self, value: T) -> Self {
-        if let Some(arguments) = &mut self.arguments {
-            arguments.add(value);
+    ///
+    /// If encoding the value fails, the error is stored and later surfaced when executing the query.
+    pub fn bind<'t, T: Encode<'t, DB> + Type<DB>>(mut self, value: T) -> Self {
+        let Ok(arguments) = self.get_arguments() else {
+            return self;
+        };
+
+        let argument_number = arguments.len() + 1;
+        if let Err(error) = arguments.add(value) {
+            self.arguments = Some(Err(format!(
+                "Encoding argument ${argument_number} failed: {error}"
+            )
+            .into()));
         }
 
         self
     }
+
+    /// Like [`Query::bind`] but immediately returns an error if encoding a value failed.
+    pub fn try_bind<'t, T: Encode<'t, DB> + Type<DB>>(
+        &mut self,
+        value: T,
+    ) -> Result<(), BoxDynError> {
+        let arguments = self.get_arguments()?;
+
+        arguments.add(value)
+    }
+
+    fn get_arguments(&mut self) -> Result<&mut DB::Arguments, BoxDynError> {
+        let Some(Ok(arguments)) = self.arguments.as_mut().map(Result::as_mut) else {
+            return Err("A previous call to Query::bind produced an error"
+                .to_owned()
+                .into());
+        };
+
+        Ok(arguments)
+    }
 }
 
-impl<'q, DB, A> Query<'q, DB, A>
+impl<DB, A> Query<'_, DB, A>
 where
     DB: Database + HasStatementCache,
 {
@@ -110,7 +144,7 @@ where
 impl<'q, DB, A: Send> Query<'q, DB, A>
 where
     DB: Database,
-    A: 'q + IntoArguments<'q, DB>,
+    A: 'q + IntoArguments<DB>,
 {
     /// Map each row in the result to another type.
     ///
@@ -159,7 +193,7 @@ where
 
     /// Execute multiple queries and return the rows affected from each query, in a stream.
     #[inline]
-    #[deprecated = "Only the SQLite driver supports multiple statements in one prepared statement and that behavior is deprecated. Use `sqlx::raw_sql()` instead."]
+    #[deprecated = "Only the SQLite driver supports multiple statements in one prepared statement and that behavior is deprecated. Use `sqlx::raw_sql()` instead. See https://github.com/launchbadge/sqlx/issues/3108 for discussion."]
     pub async fn execute_many<'e, 'c: 'e, E>(
         self,
         executor: E,
@@ -188,7 +222,7 @@ where
     /// For each query in the stream, any generated rows are returned first,
     /// then the `QueryResult` with the number of rows affected.
     #[inline]
-    #[deprecated = "Only the SQLite driver supports multiple statements in one prepared statement and that behavior is deprecated. Use `sqlx::raw_sql()` instead."]
+    #[deprecated = "Only the SQLite driver supports multiple statements in one prepared statement and that behavior is deprecated. Use `sqlx::raw_sql()` instead. See https://github.com/launchbadge/sqlx/issues/3108 for discussion."]
     // TODO: we'll probably still want a way to get the `DB::QueryResult` at the end of a `fetch()` stream.
     pub fn fetch_many<'e, 'c: 'e, E>(
         self,
@@ -267,20 +301,20 @@ where
 impl<'q, DB, F: Send, A: Send> Execute<'q, DB> for Map<'q, DB, F, A>
 where
     DB: Database,
-    A: IntoArguments<'q, DB>,
+    A: IntoArguments<DB>,
 {
     #[inline]
-    fn sql(&self) -> &'q str {
+    fn sql(self) -> SqlStr {
         self.inner.sql()
     }
 
     #[inline]
-    fn statement(&self) -> Option<&<DB as HasStatement<'q>>::Statement> {
+    fn statement(&self) -> Option<&DB::Statement> {
         self.inner.statement()
     }
 
     #[inline]
-    fn take_arguments(&mut self) -> Option<<DB as HasArguments<'q>>::Arguments> {
+    fn take_arguments(&mut self) -> Result<Option<<DB as Database>::Arguments>, BoxDynError> {
         self.inner.take_arguments()
     }
 
@@ -295,7 +329,7 @@ where
     DB: Database,
     F: FnMut(DB::Row) -> Result<O, Error> + Send,
     O: Send + Unpin,
-    A: 'q + Send + IntoArguments<'q, DB>,
+    A: 'q + Send + IntoArguments<DB>,
 {
     /// Map each row in the result to another type.
     ///
@@ -331,7 +365,7 @@ where
         let mut f = self.mapper;
         Map {
             inner: self.inner,
-            mapper: move |row| f(row).and_then(|o| g(o)),
+            mapper: move |row| f(row).and_then(&mut g),
         }
     }
 
@@ -426,9 +460,11 @@ where
         O: 'e,
     {
         self.fetch_optional(executor)
-            .and_then(|row| match row {
-                Some(row) => future::ok(row),
-                None => future::err(Error::RowNotFound),
+            .and_then(|row| {
+                future::ready(match row {
+                    Some(row) => Ok(row),
+                    None => Err(Error::RowNotFound),
+                })
             })
             .await
     }
@@ -464,32 +500,27 @@ where
 }
 
 /// Execute a single SQL query as a prepared statement (explicitly created).
-pub fn query_statement<'q, DB>(
-    statement: &'q <DB as HasStatement<'q>>::Statement,
-) -> Query<'q, DB, <DB as HasArguments<'_>>::Arguments>
+pub fn query_statement<DB>(statement: &DB::Statement) -> Query<'_, DB, <DB as Database>::Arguments>
 where
     DB: Database,
 {
     Query {
         database: PhantomData,
-        arguments: Some(Default::default()),
+        arguments: Some(Ok(Default::default())),
         statement: Either::Right(statement),
         persistent: true,
     }
 }
 
 /// Execute a single SQL query as a prepared statement (explicitly created), with the given arguments.
-pub fn query_statement_with<'q, DB, A>(
-    statement: &'q <DB as HasStatement<'q>>::Statement,
-    arguments: A,
-) -> Query<'q, DB, A>
+pub fn query_statement_with<DB, A>(statement: &DB::Statement, arguments: A) -> Query<'_, DB, A>
 where
     DB: Database,
-    A: IntoArguments<'q, DB>,
+    A: IntoArguments<DB>,
 {
     Query {
         database: PhantomData,
-        arguments: Some(arguments),
+        arguments: Some(Ok(arguments)),
         statement: Either::Right(statement),
         persistent: true,
     }
@@ -524,7 +555,8 @@ where
 /// let query = format!("SELECT * FROM articles WHERE content LIKE '%{user_input}%'");
 /// // where `conn` is `PgConnection` or `MySqlConnection`
 /// // or some other type that implements `Executor`.
-/// let results = sqlx::query(&query).fetch_all(&mut conn).await?;
+/// let results = sqlx::query(sqlx::AssertSqlSafe(query)).fetch_all(&mut conn).await?;
+/// # Ok(())
 /// # }
 /// ```
 ///
@@ -618,14 +650,14 @@ where
 ///
 /// As an additional benefit, query parameters are usually sent in a compact binary encoding instead of a human-readable
 /// text encoding, which saves bandwidth.
-pub fn query<DB>(sql: &str) -> Query<'_, DB, <DB as HasArguments<'_>>::Arguments>
+pub fn query<'a, DB>(sql: impl SqlSafeStr) -> Query<'a, DB, <DB as Database>::Arguments>
 where
     DB: Database,
 {
     Query {
         database: PhantomData,
-        arguments: Some(Default::default()),
-        statement: Either::Left(sql),
+        arguments: Some(Ok(Default::default())),
+        statement: Either::Left(sql.into_sql_str()),
         persistent: true,
     }
 }
@@ -633,15 +665,27 @@ where
 /// Execute a SQL query as a prepared statement (transparently cached), with the given arguments.
 ///
 /// See [`query()`][query] for details, such as supported syntax.
-pub fn query_with<'q, DB, A>(sql: &'q str, arguments: A) -> Query<'q, DB, A>
+pub fn query_with<'q, DB, A>(sql: impl SqlSafeStr, arguments: A) -> Query<'q, DB, A>
 where
     DB: Database,
-    A: IntoArguments<'q, DB>,
+    A: IntoArguments<DB>,
+{
+    query_with_result(sql, Ok(arguments))
+}
+
+/// Same as [`query_with`] but is initialized with a Result of arguments instead
+pub fn query_with_result<'q, DB, A>(
+    sql: impl SqlSafeStr,
+    arguments: Result<A, BoxDynError>,
+) -> Query<'q, DB, A>
+where
+    DB: Database,
+    A: IntoArguments<DB>,
 {
     Query {
         database: PhantomData,
         arguments: Some(arguments),
-        statement: Either::Left(sql),
+        statement: Either::Left(sql.into_sql_str()),
         persistent: true,
     }
 }

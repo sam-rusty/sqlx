@@ -59,42 +59,78 @@ impl Type<MySql> for i64 {
 }
 
 impl Encode<'_, MySql> for i8 {
-    fn encode_by_ref(&self, buf: &mut Vec<u8>) -> IsNull {
+    fn encode_by_ref(&self, buf: &mut Vec<u8>) -> Result<IsNull, BoxDynError> {
         buf.extend(&self.to_le_bytes());
 
-        IsNull::No
+        Ok(IsNull::No)
     }
 }
 
 impl Encode<'_, MySql> for i16 {
-    fn encode_by_ref(&self, buf: &mut Vec<u8>) -> IsNull {
+    fn encode_by_ref(&self, buf: &mut Vec<u8>) -> Result<IsNull, BoxDynError> {
         buf.extend(&self.to_le_bytes());
 
-        IsNull::No
+        Ok(IsNull::No)
     }
 }
 
 impl Encode<'_, MySql> for i32 {
-    fn encode_by_ref(&self, buf: &mut Vec<u8>) -> IsNull {
+    fn encode_by_ref(&self, buf: &mut Vec<u8>) -> Result<IsNull, BoxDynError> {
         buf.extend(&self.to_le_bytes());
 
-        IsNull::No
+        Ok(IsNull::No)
     }
 }
 
 impl Encode<'_, MySql> for i64 {
-    fn encode_by_ref(&self, buf: &mut Vec<u8>) -> IsNull {
+    fn encode_by_ref(&self, buf: &mut Vec<u8>) -> Result<IsNull, BoxDynError> {
         buf.extend(&self.to_le_bytes());
 
-        IsNull::No
+        Ok(IsNull::No)
     }
 }
 
+/// Integer part of a textual `DECIMAL`, erroring if it has a nonzero fraction.
+pub(super) fn integral_decimal_str(s: &str) -> Result<&str, BoxDynError> {
+    let (int_part, frac_part) = s.split_once('.').unwrap_or((s, ""));
+
+    if frac_part.bytes().any(|b| b != b'0') {
+        return Err(format!("DECIMAL value `{s}` has a fractional part").into());
+    }
+
+    Ok(int_part)
+}
+
 fn int_decode(value: MySqlValueRef<'_>) -> Result<i64, BoxDynError> {
+    // DECIMAL is ASCII text even over the binary protocol, so parse the digits
+    // instead of reading the bytes as a little-endian integer.
+    if matches!(
+        value.type_info.r#type,
+        ColumnType::Decimal | ColumnType::NewDecimal
+    ) {
+        return integral_decimal_str(value.as_str()?)?
+            .parse()
+            .map_err(Into::into);
+    }
+
     Ok(match value.format() {
         MySqlValueFormat::Text => value.as_str()?.parse()?,
         MySqlValueFormat::Binary => {
             let buf = value.as_bytes()?;
+
+            // Check conditions that could cause `read_int()` to panic.
+            if buf.is_empty() {
+                return Err("empty buffer".into());
+            }
+
+            if buf.len() > 8 {
+                return Err(format!(
+                    "expected no more than 8 bytes for integer value, got {}",
+                    buf.len()
+                )
+                .into());
+            }
+
             LittleEndian::read_int(buf, buf.len())
         }
     })

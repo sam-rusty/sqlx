@@ -4,9 +4,15 @@ use sqlx_cli::Opt;
 
 #[tokio::main]
 async fn main() {
-    dotenvy::dotenv().ok();
+    // Checks for `--no-dotenv` before parsing.
+    sqlx_cli::maybe_apply_dotenv();
+
+    sqlx::any::install_default_drivers();
+
+    let opt = Opt::parse();
+
     // no special handling here
-    if let Err(error) = sqlx_cli::run(Opt::parse()).await {
+    if let Err(error) = sqlx_cli::run(opt).await {
         println!("{} {}", style("error:").bold().red(), error);
         std::process::exit(1);
     }

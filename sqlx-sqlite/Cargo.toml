@@ -7,8 +7,7 @@ license.workspace = true
 edition.workspace = true
 authors.workspace = true
 repository.workspace = true
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+rust-version.workspace = true
 
 [features]
 any = ["sqlx-core/any"]
@@ -16,47 +15,94 @@ json = ["sqlx-core/json", "serde"]
 offline = ["sqlx-core/offline", "serde"]
 migrate = ["sqlx-core/migrate"]
 
-chrono = ["dep:chrono"]
+# Type integrations
+chrono = ["dep:chrono", "sqlx-core/chrono"]
+time = ["dep:time", "sqlx-core/time"]
+uuid = ["dep:uuid", "sqlx-core/uuid"]
+
 regexp = ["dep:regex"]
 
+# Conditionally compiled SQLite features
+deserialize = []
+load-extension = []
+preupdate-hook = ["libsqlite3-sys/preupdate_hook"]
+unlock-notify = ["libsqlite3-sys/unlock_notify"]
+
+bundled = ["libsqlite3-sys/bundled"]
+unbundled = ["libsqlite3-sys/buildtime_bindgen"]
+
+sqlx-toml = ["sqlx-core/sqlx-toml"]
+
+# Note: currently unused, only to satisfy "unexpected `cfg` condition" lint
+bigdecimal = []
+rust_decimal = []
+
+_unstable-all-types = [
+    "json", "chrono", "time", "uuid",
+]
+
+_unstable-all-sqlite-features = [
+    "deserialize",
+    "load-extension",
+    "preupdate-hook",
+    "unlock-notify",
+]
+
+_unstable-docs = [
+    "bundled", "any",
+    "_unstable-all-types",
+    "_unstable-all-sqlite-features"
+]
+
+[dependencies.libsqlite3-sys]
+# See `sqlx-sqlite/src/lib.rs` for details.
+version = ">=0.30.1, <0.41.0"
+default-features = false
+features = [
+    "pkg-config",
+    "vcpkg",
+]
+
 [dependencies]
-futures-core = { version = "0.3.19", default-features = false }
-futures-channel = { version = "0.3.19", default-features = false, features = ["sink", "alloc", "std"] }
+futures-core = { version = "0.3.32", default-features = false }
+futures-channel = { version = "0.3.32", default-features = false, features = ["sink", "alloc", "std"] }
 # used by the SQLite worker thread to block on the async mutex that locks the database handle
-futures-executor = { version = "0.3.19" }
+futures-executor = { version = "0.3.32" }
 futures-intrusive = "0.5.0"
-futures-util = { version = "0.3.19", default-features = false, features = ["alloc", "sink"] }
+futures-util = { version = "0.3.32", default-features = false, features = ["alloc", "sink"] }
 
 chrono = { workspace = true, optional = true }
 time = { workspace = true, optional = true }
 uuid = { workspace = true, optional = true }
 
-url = { version = "2.2.2", default-features = false }
-percent-encoding = "2.1.0"
+url = { version = "2.2.2" }
+percent-encoding = "2.3.0"
+form_urlencoded = "1.2.2"
 
-flume = { version = "0.11.0", default-features = false, features = ["async"] }
+flume = { version = "0.12.0", default-features = false, features = ["async"] }
 
 atoi = "2.0"
 
-log = "0.4.17"
+log = "0.4.18"
 tracing = { version = "0.1.37", features = ["log"] }
 
-serde = { version = "1.0.145", features = ["derive"], optional = true }
-regex = { version = "1.5.5", optional = true }
-urlencoding = "2.1.3"
+thiserror.workspace = true
 
-[dependencies.libsqlite3-sys]
-version = "0.27.0"
-default-features = false
-features = [
-    "pkg-config",
-    "vcpkg",
-    "bundled",
-    "unlock_notify"
-]
+serde = { version = "1.0.219", features = ["derive"], optional = true }
+regex = { version = "1.6.0", optional = true }
 
 [dependencies.sqlx-core]
 workspace = true
 
-[dev-dependencies]
-sqlx = { workspace = true, default-features = false, features = ["macros", "runtime-tokio", "tls-none"] }
+[dev-dependencies.sqlx]
+# FIXME: https://github.com/rust-lang/cargo/issues/15622
+# workspace = true
+path = ".."
+default-features = false
+features = ["macros", "runtime-tokio", "tls-none", "sqlite"]
+
+[lints]
+workspace = true
+
+[package.metadata.docs.rs]
+features = ["__unstable_docs"]

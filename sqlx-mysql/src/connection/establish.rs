@@ -1,10 +1,5 @@
-use bytes::buf::Buf;
-use bytes::Bytes;
-use futures_core::future::BoxFuture;
-
-use crate::collation::{CharSet, Collation};
 use crate::common::StatementCache;
-use crate::connection::{tls, MySqlStream, MAX_PACKET_SIZE};
+use crate::connection::{tls, MySqlConnectionInner, MySqlStream, MAX_PACKET_SIZE};
 use crate::error::Error;
 use crate::net::{Socket, WithSocket};
 use crate::protocol::connect::{
@@ -12,6 +7,8 @@ use crate::protocol::connect::{
 };
 use crate::protocol::Capabilities;
 use crate::{MySqlConnectOptions, MySqlConnection, MySqlSslMode};
+use bytes::buf::Buf;
+use bytes::Bytes;
 
 impl MySqlConnection {
     pub(crate) async fn establish(options: &MySqlConnectOptions) -> Result<Self, Error> {
@@ -19,60 +16,47 @@ impl MySqlConnection {
 
         let handshake = match &options.socket {
             Some(path) => crate::net::connect_uds(path, do_handshake).await?,
-            None => crate::net::connect_tcp(&options.host, options.port, do_handshake).await?,
+            None => {
+                crate::net::connect_tcp((&options.host).into(), options.port, do_handshake).await?
+            }
         };
 
-        let stream = handshake.await?;
+        let stream = handshake?;
 
         Ok(Self {
-            stream,
-            transaction_depth: 0,
-            cache_statement: StatementCache::new(options.statement_cache_capacity),
-            log_settings: options.log_settings.clone(),
+            inner: Box::new(MySqlConnectionInner {
+                stream,
+                transaction_depth: 0,
+                status_flags: Default::default(),
+                cache_statement: StatementCache::new(options.statement_cache_capacity),
+                log_settings: options.log_settings.clone(),
+            }),
         })
     }
 }
 
 struct DoHandshake<'a> {
     options: &'a MySqlConnectOptions,
-    charset: CharSet,
-    collation: Collation,
 }
 
 impl<'a> DoHandshake<'a> {
     fn new(options: &'a MySqlConnectOptions) -> Result<Self, Error> {
-        let charset: CharSet = options.charset.parse()?;
-        let collation: Collation = options
-            .collation
-            .as_deref()
-            .map(|collation| collation.parse())
-            .transpose()?
-            .unwrap_or_else(|| charset.default_collation());
-
         if options.enable_cleartext_plugin
             && matches!(
-                options.ssl_mode,
+                options.ssl_options.ssl_mode,
                 MySqlSslMode::Disabled | MySqlSslMode::Preferred
             )
         {
             log::warn!("Security warning: sending cleartext passwords without requiring SSL");
         }
 
-        Ok(Self {
-            options,
-            charset,
-            collation,
-        })
+        Ok(Self { options })
     }
 
     async fn do_handshake<S: Socket>(self, socket: S) -> Result<MySqlStream, Error> {
-        let DoHandshake {
-            options,
-            charset,
-            collation,
-        } = self;
+        let DoHandshake { options } = self;
 
-        let mut stream = MySqlStream::with_socket(charset, collation, options, socket);
+        let mut stream = MySqlStream::with_socket(options, socket);
 
         // https://dev.mysql.com/doc/internals/en/connection-phase.html
         // https://mariadb.com/kb/en/connection/
@@ -80,7 +64,9 @@ impl<'a> DoHandshake<'a> {
         let handshake: Handshake = stream.recv_packet().await?.decode()?;
 
         let mut plugin = handshake.auth_plugin;
-        let nonce = handshake.auth_plugin_data;
+        // `mut`: an AuthSwitchRequest carries a fresh nonce, and the plugin's follow-up
+        // exchange (e.g. caching_sha2_password full authentication) must use it.
+        let mut nonce = handshake.auth_plugin_data;
 
         // FIXME: server version parse is a bit ugly
         // expecting MAJOR.MINOR.PATCH
@@ -123,13 +109,13 @@ impl<'a> DoHandshake<'a> {
         };
 
         stream.write_packet(HandshakeResponse {
-            collation: stream.collation as u8,
+            charset: super::INITIAL_CHARSET,
             max_packet_size: MAX_PACKET_SIZE,
             username: &options.username,
             database: options.database.as_deref(),
             auth_plugin: plugin,
             auth_response: auth_response.as_deref(),
-        });
+        })?;
 
         stream.flush().await?;
 
@@ -147,7 +133,7 @@ impl<'a> DoHandshake<'a> {
                         packet.decode_with(self.options.enable_cleartext_plugin)?;
 
                     plugin = Some(switch.plugin);
-                    let nonce = switch.data.chain(Bytes::new());
+                    nonce = switch.data.chain(Bytes::new());
 
                     let response = switch
                         .plugin
@@ -158,7 +144,7 @@ impl<'a> DoHandshake<'a> {
                         )
                         .await?;
 
-                    stream.write_packet(AuthSwitchResponse(response));
+                    stream.write_packet(AuthSwitchResponse(response))?;
                     stream.flush().await?;
                 }
 
@@ -184,10 +170,10 @@ impl<'a> DoHandshake<'a> {
     }
 }
 
-impl<'a> WithSocket for DoHandshake<'a> {
-    type Output = BoxFuture<'a, Result<MySqlStream, Error>>;
+impl WithSocket for DoHandshake<'_> {
+    type Output = Result<MySqlStream, Error>;
 
-    fn with_socket<S: Socket>(self, socket: S) -> Self::Output {
-        Box::pin(self.do_handshake(socket))
+    async fn with_socket<S: Socket>(self, socket: S) -> Self::Output {
+        self.do_handshake(socket).await
     }
 }

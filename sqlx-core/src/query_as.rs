@@ -5,12 +5,13 @@ use futures_core::stream::BoxStream;
 use futures_util::{StreamExt, TryStreamExt};
 
 use crate::arguments::IntoArguments;
-use crate::database::{Database, HasArguments, HasStatement, HasStatementCache};
+use crate::database::{Database, HasStatementCache};
 use crate::encode::Encode;
-use crate::error::Error;
+use crate::error::{BoxDynError, Error};
 use crate::executor::{Execute, Executor};
 use crate::from_row::FromRow;
-use crate::query::{query, query_statement, query_statement_with, query_with, Query};
+use crate::query::{query, query_statement, query_statement_with, query_with_result, Query};
+use crate::sql_str::{SqlSafeStr, SqlStr};
 use crate::types::Type;
 
 /// A single SQL query as a prepared statement, mapping results using [`FromRow`].
@@ -24,20 +25,20 @@ pub struct QueryAs<'q, DB: Database, O, A> {
 impl<'q, DB, O: Send, A: Send> Execute<'q, DB> for QueryAs<'q, DB, O, A>
 where
     DB: Database,
-    A: 'q + IntoArguments<'q, DB>,
+    A: 'q + IntoArguments<DB>,
 {
     #[inline]
-    fn sql(&self) -> &'q str {
+    fn sql(self) -> SqlStr {
         self.inner.sql()
     }
 
     #[inline]
-    fn statement(&self) -> Option<&<DB as HasStatement<'q>>::Statement> {
+    fn statement(&self) -> Option<&DB::Statement> {
         self.inner.statement()
     }
 
     #[inline]
-    fn take_arguments(&mut self) -> Option<<DB as HasArguments<'q>>::Arguments> {
+    fn take_arguments(&mut self) -> Result<Option<<DB as Database>::Arguments>, BoxDynError> {
         self.inner.take_arguments()
     }
 
@@ -47,17 +48,17 @@ where
     }
 }
 
-impl<'q, DB: Database, O> QueryAs<'q, DB, O, <DB as HasArguments<'q>>::Arguments> {
+impl<'q, DB: Database, O> QueryAs<'q, DB, O, <DB as Database>::Arguments> {
     /// Bind a value for use with this SQL query.
     ///
     /// See [`Query::bind`](Query::bind).
-    pub fn bind<T: 'q + Send + Encode<'q, DB> + Type<DB>>(mut self, value: T) -> Self {
+    pub fn bind<T: 'q + Encode<'q, DB> + Type<DB>>(mut self, value: T) -> Self {
         self.inner = self.inner.bind(value);
         self
     }
 }
 
-impl<'q, DB, O, A> QueryAs<'q, DB, O, A>
+impl<DB, O, A> QueryAs<'_, DB, O, A>
 where
     DB: Database + HasStatementCache,
 {
@@ -82,7 +83,7 @@ where
 impl<'q, DB, O, A> QueryAs<'q, DB, O, A>
 where
     DB: Database,
-    A: 'q + IntoArguments<'q, DB>,
+    A: 'q + IntoArguments<DB>,
     O: Send + Unpin + for<'r> FromRow<'r, DB::Row>,
 {
     /// Execute the query and return the generated results as a stream.
@@ -94,17 +95,15 @@ where
         O: 'e,
         A: 'e,
     {
-        // FIXME: this should have used `executor.fetch()` but that's a breaking change
-        // because this technically allows multiple statements in one query string.
-        #[allow(deprecated)]
-        self.fetch_many(executor)
-            .try_filter_map(|step| async move { Ok(step.right()) })
+        executor
+            .fetch(self.inner)
+            .map(|row| O::from_row(&row?))
             .boxed()
     }
 
     /// Execute multiple queries and return the generated results as a stream
     /// from each query, in a stream.
-    #[deprecated = "Only the SQLite driver supports multiple statements in one prepared statement and that behavior is deprecated. Use `sqlx::raw_sql()` instead."]
+    #[deprecated = "Only the SQLite driver supports multiple statements in one prepared statement and that behavior is deprecated. Use `sqlx::raw_sql()` instead. See https://github.com/launchbadge/sqlx/issues/3108 for discussion."]
     pub fn fetch_many<'e, 'c: 'e, E>(
         self,
         executor: E,
@@ -227,7 +226,7 @@ where
 /// let mut conn: PgConnection = PgConnection::connect("<Database URL>").await?;
 ///
 /// sqlx::raw_sql(
-///     "CREATE TABLE users(id INTEGER PRIMARY KEY, username TEXT UNIQUE, created_at TIMESTAMP DEFAULT (now())"
+///     "CREATE TABLE users(id INTEGER PRIMARY KEY, username TEXT UNIQUE, created_at TIMESTAMPTZ DEFAULT (now()))"
 /// )
 ///     .execute(&mut conn)
 ///     .await?;
@@ -238,7 +237,7 @@ where
 ///
 /// // Get the first row of the result (note the `LIMIT 1` for efficiency)
 /// // This assumes the `time` feature of SQLx is enabled.
-/// let oldest_user: (i64, String, time::OffsetDateTime) = sqlx::query_as(
+/// let oldest_user: (i32, String, time::OffsetDateTime) = sqlx::query_as(
 ///     "SELECT id, username, created_at FROM users ORDER BY created_at LIMIT 1"
 /// )
 ///     .fetch_one(&mut conn)
@@ -248,7 +247,7 @@ where
 /// assert_eq!(oldest_user.1, "alice");
 ///
 /// // Get at most one row
-/// let maybe_charlie: Option<(i64, String, time::OffsetDateTime)> = sqlx::query_as(
+/// let maybe_charlie: Option<(i32, String, time::OffsetDateTime)> = sqlx::query_as(
 ///     "SELECT id, username, created_at FROM users WHERE username = 'charlie'"
 /// )
 ///     .fetch_optional(&mut conn)
@@ -257,7 +256,7 @@ where
 /// assert_eq!(maybe_charlie, None);
 ///
 /// // Get all rows in result (Beware of the size of the result set! Consider using `LIMIT`)
-/// let users: Vec<(i64, String, time::OffsetDateTime)> = sqlx::query_as(
+/// let users: Vec<(i32, String, time::OffsetDateTime)> = sqlx::query_as(
 ///     "SELECT id, username, created_at FROM users ORDER BY id"
 /// )
 ///     .fetch_all(&mut conn)
@@ -339,7 +338,7 @@ where
 ///
 /// ```
 #[inline]
-pub fn query_as<'q, DB, O>(sql: &'q str) -> QueryAs<'q, DB, O, <DB as HasArguments<'q>>::Arguments>
+pub fn query_as<'q, DB, O>(sql: impl SqlSafeStr) -> QueryAs<'q, DB, O, <DB as Database>::Arguments>
 where
     DB: Database,
     O: for<'r> FromRow<'r, DB::Row>,
@@ -357,22 +356,36 @@ where
 ///
 /// For details about type mapping from [`FromRow`], see [`query_as()`].
 #[inline]
-pub fn query_as_with<'q, DB, O, A>(sql: &'q str, arguments: A) -> QueryAs<'q, DB, O, A>
+pub fn query_as_with<'q, DB, O, A>(sql: impl SqlSafeStr, arguments: A) -> QueryAs<'q, DB, O, A>
 where
     DB: Database,
-    A: IntoArguments<'q, DB>,
+    A: IntoArguments<DB>,
+    O: for<'r> FromRow<'r, DB::Row>,
+{
+    query_as_with_result(sql, Ok(arguments))
+}
+
+/// Same as [`query_as_with`] but takes arguments as a Result
+#[inline]
+pub fn query_as_with_result<'q, DB, O, A>(
+    sql: impl SqlSafeStr,
+    arguments: Result<A, BoxDynError>,
+) -> QueryAs<'q, DB, O, A>
+where
+    DB: Database,
+    A: IntoArguments<DB>,
     O: for<'r> FromRow<'r, DB::Row>,
 {
     QueryAs {
-        inner: query_with(sql, arguments),
+        inner: query_with_result(sql, arguments),
         output: PhantomData,
     }
 }
 
 // Make a SQL query from a statement, that is mapped to a concrete type.
-pub fn query_statement_as<'q, DB, O>(
-    statement: &'q <DB as HasStatement<'q>>::Statement,
-) -> QueryAs<'q, DB, O, <DB as HasArguments<'_>>::Arguments>
+pub fn query_statement_as<DB, O>(
+    statement: &DB::Statement,
+) -> QueryAs<'_, DB, O, <DB as Database>::Arguments>
 where
     DB: Database,
     O: for<'r> FromRow<'r, DB::Row>,
@@ -385,12 +398,12 @@ where
 
 // Make a SQL query from a statement, with the given arguments, that is mapped to a concrete type.
 pub fn query_statement_as_with<'q, DB, O, A>(
-    statement: &'q <DB as HasStatement<'q>>::Statement,
+    statement: &'q DB::Statement,
     arguments: A,
 ) -> QueryAs<'q, DB, O, A>
 where
     DB: Database,
-    A: IntoArguments<'q, DB>,
+    A: IntoArguments<DB>,
     O: for<'r> FromRow<'r, DB::Row>,
 {
     QueryAs {

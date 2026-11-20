@@ -19,12 +19,13 @@ impl PgHasArrayType for NaiveTime {
 }
 
 impl Encode<'_, Postgres> for NaiveTime {
-    fn encode_by_ref(&self, buf: &mut PgArgumentBuffer) -> IsNull {
+    fn encode_by_ref(&self, buf: &mut PgArgumentBuffer) -> Result<IsNull, BoxDynError> {
         // TIME is encoded as the microseconds since midnight
-        // NOTE: panic! is on overflow and 1 day does not have enough micros to overflow
-        let us = (*self - NaiveTime::default()).num_microseconds().unwrap();
+        let micros = (*self - NaiveTime::default())
+            .num_microseconds()
+            .ok_or_else(|| format!("Time out of range for PostgreSQL: {self}"))?;
 
-        Encode::<Postgres>::encode(&us, buf)
+        Encode::<Postgres>::encode(micros, buf)
     }
 
     fn size_hint(&self) -> usize {
@@ -38,7 +39,19 @@ impl<'r> Decode<'r, Postgres> for NaiveTime {
             PgValueFormat::Binary => {
                 // TIME is encoded as the microseconds since midnight
                 let us: i64 = Decode::<Postgres>::decode(value)?;
-                NaiveTime::default() + Duration::microseconds(us)
+
+                // Postgres allows `24:00:00`, which would otherwise wrap around to midnight
+                let (time, overflow) =
+                    NaiveTime::default().overflowing_add_signed(Duration::microseconds(us));
+
+                if overflow != 0 {
+                    return Err(format!(
+                        "Postgres TIME out of range for NaiveTime: {us} microseconds from midnight"
+                    )
+                    .into());
+                }
+
+                time
             }
 
             PgValueFormat::Text => NaiveTime::parse_from_str(value.as_str()?, "%H:%M:%S%.f")?,

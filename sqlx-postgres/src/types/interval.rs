@@ -10,11 +10,37 @@ use crate::{PgArgumentBuffer, PgHasArrayType, PgTypeInfo, PgValueFormat, PgValue
 
 // `PgInterval` is available for direct access to the INTERVAL type
 
-#[derive(Debug, Eq, PartialEq, Clone, Hash, Default)]
+#[derive(Debug, Eq, PartialEq, Clone, Copy, Hash, Default)]
 pub struct PgInterval {
     pub months: i32,
     pub days: i32,
     pub microseconds: i64,
+}
+
+impl PgInterval {
+    pub const INFINITY: Self = Self {
+        months: i32::MAX,
+        days: i32::MAX,
+        microseconds: i64::MAX,
+    };
+
+    pub const NEG_INFINITY: Self = Self {
+        months: i32::MIN,
+        days: i32::MIN,
+        microseconds: i64::MIN,
+    };
+
+    pub fn is_infinite(&self) -> bool {
+        *self == Self::INFINITY || *self == Self::NEG_INFINITY
+    }
+
+    pub fn is_positive_infinity(&self) -> bool {
+        *self == Self::INFINITY
+    }
+
+    pub fn is_negative_infinity(&self) -> bool {
+        *self == Self::NEG_INFINITY
+    }
 }
 
 impl Type<Postgres> for PgInterval {
@@ -54,12 +80,12 @@ impl<'de> Decode<'de, Postgres> for PgInterval {
 }
 
 impl Encode<'_, Postgres> for PgInterval {
-    fn encode_by_ref(&self, buf: &mut PgArgumentBuffer) -> IsNull {
+    fn encode_by_ref(&self, buf: &mut PgArgumentBuffer) -> Result<IsNull, BoxDynError> {
         buf.extend(&self.microseconds.to_be_bytes());
         buf.extend(&self.days.to_be_bytes());
         buf.extend(&self.months.to_be_bytes());
 
-        IsNull::No
+        Ok(IsNull::No)
     }
 
     fn size_hint(&self) -> usize {
@@ -83,10 +109,8 @@ impl PgHasArrayType for std::time::Duration {
 }
 
 impl Encode<'_, Postgres> for std::time::Duration {
-    fn encode_by_ref(&self, buf: &mut PgArgumentBuffer) -> IsNull {
-        PgInterval::try_from(*self)
-            .expect("failed to encode `std::time::Duration`")
-            .encode_by_ref(buf)
+    fn encode_by_ref(&self, buf: &mut PgArgumentBuffer) -> Result<IsNull, BoxDynError> {
+        PgInterval::try_from(*self)?.encode_by_ref(buf)
     }
 
     fn size_hint(&self) -> usize {
@@ -102,7 +126,7 @@ impl TryFrom<std::time::Duration> for PgInterval {
     /// This returns an error if there is a loss of precision using nanoseconds or if there is a
     /// microsecond overflow.
     fn try_from(value: std::time::Duration) -> Result<Self, BoxDynError> {
-        if value.as_nanos() % 1000 != 0 {
+        if !value.as_nanos().is_multiple_of(1000) {
             return Err("PostgreSQL `INTERVAL` does not support nanoseconds precision".into());
         }
 
@@ -130,8 +154,8 @@ impl PgHasArrayType for chrono::Duration {
 
 #[cfg(feature = "chrono")]
 impl Encode<'_, Postgres> for chrono::Duration {
-    fn encode_by_ref(&self, buf: &mut PgArgumentBuffer) -> IsNull {
-        let pg_interval = PgInterval::try_from(*self).expect("Failed to encode chrono::Duration");
+    fn encode_by_ref(&self, buf: &mut PgArgumentBuffer) -> Result<IsNull, BoxDynError> {
+        let pg_interval = PgInterval::try_from(*self)?;
         pg_interval.encode_by_ref(buf)
     }
 
@@ -169,7 +193,7 @@ impl TryFrom<chrono::Duration> for PgInterval {
                 Ok(Self {
                     months: 0,
                     days: 0,
-                    microseconds: microseconds,
+                    microseconds,
                 })
             },
         )
@@ -192,8 +216,8 @@ impl PgHasArrayType for time::Duration {
 
 #[cfg(feature = "time")]
 impl Encode<'_, Postgres> for time::Duration {
-    fn encode_by_ref(&self, buf: &mut PgArgumentBuffer) -> IsNull {
-        let pg_interval = PgInterval::try_from(*self).expect("Failed to encode time::Duration");
+    fn encode_by_ref(&self, buf: &mut PgArgumentBuffer) -> Result<IsNull, BoxDynError> {
+        let pg_interval = PgInterval::try_from(*self)?;
         pg_interval.encode_by_ref(buf)
     }
 
@@ -233,8 +257,8 @@ fn test_encode_interval() {
         microseconds: 0,
     };
     assert!(matches!(
-        Encode::<Postgres>::encode(&interval, &mut buf),
-        IsNull::No
+        Encode::<Postgres>::encode(interval, &mut buf),
+        Ok(IsNull::No)
     ));
     assert_eq!(&**buf, [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
     buf.clear();
@@ -245,8 +269,8 @@ fn test_encode_interval() {
         microseconds: 1_000,
     };
     assert!(matches!(
-        Encode::<Postgres>::encode(&interval, &mut buf),
-        IsNull::No
+        Encode::<Postgres>::encode(interval, &mut buf),
+        Ok(IsNull::No)
     ));
     assert_eq!(&**buf, [0, 0, 0, 0, 0, 0, 3, 232, 0, 0, 0, 0, 0, 0, 0, 0]);
     buf.clear();
@@ -257,8 +281,8 @@ fn test_encode_interval() {
         microseconds: 1_000_000,
     };
     assert!(matches!(
-        Encode::<Postgres>::encode(&interval, &mut buf),
-        IsNull::No
+        Encode::<Postgres>::encode(interval, &mut buf),
+        Ok(IsNull::No)
     ));
     assert_eq!(&**buf, [0, 0, 0, 0, 0, 15, 66, 64, 0, 0, 0, 0, 0, 0, 0, 0]);
     buf.clear();
@@ -269,8 +293,8 @@ fn test_encode_interval() {
         microseconds: 3_600_000_000,
     };
     assert!(matches!(
-        Encode::<Postgres>::encode(&interval, &mut buf),
-        IsNull::No
+        Encode::<Postgres>::encode(interval, &mut buf),
+        Ok(IsNull::No)
     ));
     assert_eq!(
         &**buf,
@@ -284,8 +308,8 @@ fn test_encode_interval() {
         microseconds: 0,
     };
     assert!(matches!(
-        Encode::<Postgres>::encode(&interval, &mut buf),
-        IsNull::No
+        Encode::<Postgres>::encode(interval, &mut buf),
+        Ok(IsNull::No)
     ));
     assert_eq!(&**buf, [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0]);
     buf.clear();
@@ -296,8 +320,8 @@ fn test_encode_interval() {
         microseconds: 0,
     };
     assert!(matches!(
-        Encode::<Postgres>::encode(&interval, &mut buf),
-        IsNull::No
+        Encode::<Postgres>::encode(interval, &mut buf),
+        Ok(IsNull::No)
     ));
     assert_eq!(&**buf, [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
     buf.clear();
@@ -330,6 +354,25 @@ fn test_pginterval_std() {
 
     // Case when microsecond overflow occurs
     assert!(PgInterval::try_from(std::time::Duration::from_secs(20_000_000_000_000)).is_err());
+}
+
+#[test]
+fn test_pginterval_infinity() {
+    assert!(PgInterval::INFINITY.is_infinite());
+    assert!(PgInterval::NEG_INFINITY.is_infinite());
+    assert!(PgInterval::INFINITY.is_positive_infinity());
+    assert!(!PgInterval::NEG_INFINITY.is_positive_infinity());
+    assert!(!PgInterval::INFINITY.is_negative_infinity());
+    assert!(PgInterval::NEG_INFINITY.is_negative_infinity());
+    assert!(!PgInterval::default().is_infinite());
+
+    // verify values match what PostgreSQL expects
+    assert_eq!(PgInterval::INFINITY.microseconds, i64::MAX);
+    assert_eq!(PgInterval::INFINITY.days, i32::MAX);
+    assert_eq!(PgInterval::INFINITY.months, i32::MAX);
+    assert_eq!(PgInterval::NEG_INFINITY.microseconds, i64::MIN);
+    assert_eq!(PgInterval::NEG_INFINITY.days, i32::MIN);
+    assert_eq!(PgInterval::NEG_INFINITY.months, i32::MIN);
 }
 
 #[test]

@@ -1,15 +1,21 @@
 extern crate time_ as time;
 
+use std::borrow::Cow;
 use std::net::SocketAddr;
+use std::rc::Rc;
 #[cfg(feature = "rust_decimal")]
 use std::str::FromStr;
+use std::sync::Arc;
 
 use sqlx::mysql::MySql;
 use sqlx::{Executor, Row};
 
 use sqlx::types::Text;
 
-use sqlx_test::{new, test_type};
+use sqlx::mysql::types::MySqlTime;
+use sqlx_mysql::types::MySqlTimeSign;
+
+use sqlx_test::{new, test_prepared_type, test_type};
 
 test_type!(bool(MySql, "false" == false, "true" == true));
 
@@ -24,6 +30,43 @@ test_type!(i32(MySql, "2141512" == 2141512_i32));
 
 test_type!(u64(MySql, "CAST(2141512 AS UNSIGNED)" == 2141512_u64));
 test_type!(i64(MySql, "2141512" == 2141512_i64));
+
+// A DECIMAL (e.g. `SUM()` over integers) is sent as text even over the binary
+// protocol, so decoding one into an integer must parse the digits rather than
+// read the ASCII bytes as a little-endian integer.
+#[sqlx_macros::test]
+async fn decode_integer_from_decimal() -> anyhow::Result<()> {
+    let mut conn = new::<MySql>().await?;
+
+    // Prepared statement => binary protocol; b"13" read as LE would be 13105.
+    let row = sqlx::query("SELECT CAST(13 AS DECIMAL(4, 0))")
+        .fetch_one(&mut conn)
+        .await?;
+    assert_eq!(row.try_get_unchecked::<u64, _>(0)?, 13);
+    assert_eq!(row.try_get_unchecked::<i64, _>(0)?, 13);
+
+    // Integral value with a nonzero scale.
+    let row = sqlx::query("SELECT CAST(13.00 AS DECIMAL(6, 2))")
+        .fetch_one(&mut conn)
+        .await?;
+    assert_eq!(row.try_get_unchecked::<u64, _>(0)?, 13);
+
+    // Negative values are signed-only.
+    let row = sqlx::query("SELECT CAST(-7 AS DECIMAL(4, 0))")
+        .fetch_one(&mut conn)
+        .await?;
+    assert_eq!(row.try_get_unchecked::<i64, _>(0)?, -7);
+    assert!(row.try_get_unchecked::<u64, _>(0).is_err());
+
+    // A real fraction errors instead of silently corrupting.
+    let row = sqlx::query("SELECT CAST(13.5 AS DECIMAL(4, 1))")
+        .fetch_one(&mut conn)
+        .await?;
+    let err = row.try_get_unchecked::<u64, _>(0).unwrap_err().to_string();
+    assert!(err.contains("fractional"), "unexpected error: {err}");
+
+    Ok(())
+}
 
 test_type!(f64(MySql, "3.14159265e0" == 3.14159265_f64));
 
@@ -44,6 +87,14 @@ test_type!(bytes<Vec<u8>>(MySql,
         == Vec::<u8>::new(),
     "X'0000000052'"
         == vec![0_u8, 0, 0, 0, 0x52]
+));
+
+test_type!(byte_array_empty<[u8; 0]>(MySql,
+    "X''" == [0_u8; 0],
+));
+
+test_type!(byte_array<[u8; 4]>(MySql,
+    "X'DEADBEEF'" == [0xDE_u8, 0xAD, 0xBE, 0xEF],
 ));
 
 #[cfg(feature = "uuid")]
@@ -70,34 +121,44 @@ test_type!(uuid_simple<sqlx::types::uuid::fmt::Simple>(MySql,
         == sqlx::types::Uuid::parse_str("00000000000000000000000000000000").unwrap().simple()
 ));
 
+test_type!(mysql_time<MySqlTime>(MySql,
+    "TIME '00:00:00.000000'" == MySqlTime::ZERO,
+    "TIME '-00:00:00.000000'" == MySqlTime::ZERO,
+    "TIME '838:59:59.0'" == MySqlTime::MAX,
+    "TIME '-838:59:59.0'" == MySqlTime::MIN,
+    "TIME '123:45:56.890'" == MySqlTime::new(MySqlTimeSign::Positive, 123, 45, 56, 890_000).unwrap(),
+    "TIME '-123:45:56.890'" == MySqlTime::new(MySqlTimeSign::Negative, 123, 45, 56, 890_000).unwrap(),
+    "TIME '123:45:56.890011'" == MySqlTime::new(MySqlTimeSign::Positive, 123, 45, 56, 890_011).unwrap(),
+    "TIME '-123:45:56.890011'" == MySqlTime::new(MySqlTimeSign::Negative, 123, 45, 56, 890_011).unwrap(),
+));
+
 #[cfg(feature = "chrono")]
 mod chrono {
-    use sqlx::types::chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
+    use sqlx::types::chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
 
     use super::*;
 
     test_type!(chrono_date<NaiveDate>(MySql,
-        "DATE '2001-01-05'" == NaiveDate::from_ymd(2001, 1, 5),
-        "DATE '2050-11-23'" == NaiveDate::from_ymd(2050, 11, 23)
+        "DATE '2001-01-05'" == NaiveDate::from_ymd_opt(2001, 1, 5).unwrap(),
+        "DATE '2050-11-23'" == NaiveDate::from_ymd_opt(2050, 11, 23).unwrap()
     ));
 
     test_type!(chrono_time_zero<NaiveTime>(MySql,
-        "TIME '00:00:00.000000'" == NaiveTime::from_hms_micro(0, 0, 0, 0)
+        "TIME '00:00:00.000000'" == NaiveTime::from_hms_micro_opt(0, 0, 0, 0).unwrap()
     ));
 
     test_type!(chrono_time<NaiveTime>(MySql,
-        "TIME '05:10:20.115100'" == NaiveTime::from_hms_micro(5, 10, 20, 115100)
+        "TIME '05:10:20.115100'" == NaiveTime::from_hms_micro_opt(5, 10, 20, 115100).unwrap()
     ));
 
     test_type!(chrono_date_time<NaiveDateTime>(MySql,
-        "TIMESTAMP '2019-01-02 05:10:20'" == NaiveDate::from_ymd(2019, 1, 2).and_hms(5, 10, 20)
+        "TIMESTAMP '2019-01-02 05:10:20'" == NaiveDate::from_ymd_opt(2019, 1, 2).unwrap().and_hms_opt(5, 10, 20).unwrap()
     ));
 
     test_type!(chrono_timestamp<DateTime::<Utc>>(MySql,
         "TIMESTAMP '2019-01-02 05:10:20.115100'"
-            == DateTime::<Utc>::from_utc(
-                NaiveDate::from_ymd(2019, 1, 2).and_hms_micro(5, 10, 20, 115100),
-                Utc,
+            == Utc.from_utc_datetime(
+                &NaiveDate::from_ymd_opt(2019, 1, 2).unwrap().and_hms_micro_opt(5, 10, 20, 115100).unwrap(),
             )
     ));
 
@@ -287,6 +348,21 @@ mod json_tests {
     ));
 }
 
+test_type!(test_arc<Arc<i32>>(MySql, "1" == Arc::new(1i32)));
+test_type!(test_cow<Cow<'_, i32>>(MySql, "1" == Cow::<i32>::Owned(1i32)));
+test_type!(test_box<Box<i32>>(MySql, "1" == Box::new(1i32)));
+test_type!(test_rc<Rc<i32>>(MySql, "1" == Rc::new(1i32)));
+
+test_type!(test_box_str<Box<str>>(MySql, "'John'" == Box::<str>::from("John")));
+test_type!(test_cow_str<Cow<'_, str>>(MySql, "'Phil'" == Cow::<'static, str>::from("Phil")));
+test_type!(test_arc_str<Arc<str>>(MySql, "'1234'" == Arc::<str>::from("1234")));
+test_type!(test_rc_str<Rc<str>>(MySql, "'5678'" == Rc::<str>::from("5678")));
+
+test_prepared_type!(test_box_slice<Box<[u8]>>(MySql, "X'01020304'" == Box::<[u8]>::from([1,2,3,4])));
+test_prepared_type!(test_cow_slice<Cow<'_, [u8]>>(MySql, "X'01020304'" == Cow::<'static, [u8]>::from(&[1,2,3,4])));
+test_prepared_type!(test_arc_slice<Arc<[u8]>>(MySql, "X'01020304'" == Arc::<[u8]>::from([1,2,3,4])));
+test_prepared_type!(test_rc_slice<Rc<[u8]>>(MySql, "X'01020304'" == Rc::<[u8]>::from([1,2,3,4])));
+
 #[sqlx_macros::test]
 async fn test_bits() -> anyhow::Result<()> {
     let mut conn = new::<MySql>().await?;
@@ -303,8 +379,8 @@ CREATE TEMPORARY TABLE with_bits (
     .await?;
 
     sqlx::query("INSERT INTO with_bits (value_1, value_n) VALUES (?, ?)")
-        .bind(&1_u8)
-        .bind(&510202_u32)
+        .bind(1_u8)
+        .bind(510202_u32)
         .execute(&mut conn)
         .await?;
 

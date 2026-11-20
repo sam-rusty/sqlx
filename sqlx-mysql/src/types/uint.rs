@@ -1,3 +1,5 @@
+use super::int::integral_decimal_str;
+use crate::collation::Collation;
 use crate::decode::Decode;
 use crate::encode::{Encode, IsNull};
 use crate::error::BoxDynError;
@@ -10,7 +12,7 @@ fn uint_type_info(ty: ColumnType) -> MySqlTypeInfo {
     MySqlTypeInfo {
         r#type: ty,
         flags: ColumnFlags::BINARY | ColumnFlags::UNSIGNED,
-        char_set: 63,
+        collation: Collation::BINARY,
         max_size: None,
     }
 }
@@ -69,34 +71,34 @@ impl Type<MySql> for u64 {
 }
 
 impl Encode<'_, MySql> for u8 {
-    fn encode_by_ref(&self, buf: &mut Vec<u8>) -> IsNull {
+    fn encode_by_ref(&self, buf: &mut Vec<u8>) -> Result<IsNull, BoxDynError> {
         buf.extend(&self.to_le_bytes());
 
-        IsNull::No
+        Ok(IsNull::No)
     }
 }
 
 impl Encode<'_, MySql> for u16 {
-    fn encode_by_ref(&self, buf: &mut Vec<u8>) -> IsNull {
+    fn encode_by_ref(&self, buf: &mut Vec<u8>) -> Result<IsNull, BoxDynError> {
         buf.extend(&self.to_le_bytes());
 
-        IsNull::No
+        Ok(IsNull::No)
     }
 }
 
 impl Encode<'_, MySql> for u32 {
-    fn encode_by_ref(&self, buf: &mut Vec<u8>) -> IsNull {
+    fn encode_by_ref(&self, buf: &mut Vec<u8>) -> Result<IsNull, BoxDynError> {
         buf.extend(&self.to_le_bytes());
 
-        IsNull::No
+        Ok(IsNull::No)
     }
 }
 
 impl Encode<'_, MySql> for u64 {
-    fn encode_by_ref(&self, buf: &mut Vec<u8>) -> IsNull {
+    fn encode_by_ref(&self, buf: &mut Vec<u8>) -> Result<IsNull, BoxDynError> {
         buf.extend(&self.to_le_bytes());
 
-        IsNull::No
+        Ok(IsNull::No)
     }
 }
 
@@ -114,11 +116,36 @@ fn uint_decode(value: MySqlValueRef<'_>) -> Result<u64, BoxDynError> {
         return Ok(value);
     }
 
+    // DECIMAL is ASCII text even over the binary protocol (e.g. `SUM()` over
+    // integers yields one); parse the digits rather than the raw bytes.
+    if matches!(
+        value.type_info.r#type,
+        ColumnType::Decimal | ColumnType::NewDecimal
+    ) {
+        return integral_decimal_str(value.as_str()?)?
+            .parse()
+            .map_err(Into::into);
+    }
+
     Ok(match value.format() {
         MySqlValueFormat::Text => value.as_str()?.parse()?,
 
         MySqlValueFormat::Binary => {
             let buf = value.as_bytes()?;
+
+            // Check conditions that could cause `read_uint()` to panic.
+            if buf.is_empty() {
+                return Err("empty buffer".into());
+            }
+
+            if buf.len() > 8 {
+                return Err(format!(
+                    "expected no more than 8 bytes for unsigned integer value, got {}",
+                    buf.len()
+                )
+                .into());
+            }
+
             LittleEndian::read_uint(buf, buf.len())
         }
     })

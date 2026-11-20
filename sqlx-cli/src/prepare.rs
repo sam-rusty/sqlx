@@ -5,22 +5,24 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::metadata::{manifest_dir, Metadata};
+use crate::opt::ConnectOpts;
+use crate::Config;
 use anyhow::{bail, Context};
 use console::style;
 use sqlx::Connection;
 
-use crate::metadata::{manifest_dir, Metadata};
-use crate::opt::ConnectOpts;
-
-pub struct PrepareCtx {
+pub struct PrepareCtx<'a> {
+    pub config: &'a Config,
     pub workspace: bool,
+    pub all: bool,
     pub cargo: OsString,
     pub cargo_args: Vec<String>,
     pub metadata: Metadata,
     pub connect_opts: ConnectOpts,
 }
 
-impl PrepareCtx {
+impl PrepareCtx<'_> {
     /// Path to the directory where cached queries should be placed.
     fn prepare_dir(&self) -> anyhow::Result<PathBuf> {
         if self.workspace {
@@ -32,13 +34,14 @@ impl PrepareCtx {
 }
 
 pub async fn run(
+    config: &Config,
     check: bool,
+    all: bool,
     workspace: bool,
     connect_opts: ConnectOpts,
     cargo_args: Vec<String>,
 ) -> anyhow::Result<()> {
-    let cargo = env::var_os("CARGO")
-        .context("failed to get value of `CARGO`; `prepare` subcommand may only be invoked as `cargo sqlx prepare`")?;
+    let cargo = cargo_command(env::var_os("CARGO"))?;
 
     anyhow::ensure!(
         Path::new("Cargo.toml").exists(),
@@ -48,7 +51,9 @@ hint: This command only works in the manifest directory of a Cargo package or wo
 
     let metadata: Metadata = Metadata::from_current_directory(&cargo)?;
     let ctx = PrepareCtx {
+        config,
         workspace,
+        all,
         cargo,
         cargo_args,
         metadata,
@@ -62,9 +67,16 @@ hint: This command only works in the manifest directory of a Cargo package or wo
     }
 }
 
-async fn prepare(ctx: &PrepareCtx) -> anyhow::Result<()> {
+fn cargo_command(cargo: Option<OsString>) -> anyhow::Result<OsString> {
+    cargo.context(
+        "the `prepare` subcommand must be invoked as `cargo sqlx prepare`; \
+         running `sqlx prepare` directly is not supported",
+    )
+}
+
+async fn prepare(ctx: &PrepareCtx<'_>) -> anyhow::Result<()> {
     if ctx.connect_opts.database_url.is_some() {
-        check_backend(&ctx.connect_opts).await?;
+        check_backend(ctx.config, &ctx.connect_opts).await?;
     }
 
     let prepare_dir = ctx.prepare_dir()?;
@@ -90,9 +102,9 @@ async fn prepare(ctx: &PrepareCtx) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn prepare_check(ctx: &PrepareCtx) -> anyhow::Result<()> {
+async fn prepare_check(ctx: &PrepareCtx<'_>) -> anyhow::Result<()> {
     if ctx.connect_opts.database_url.is_some() {
-        check_backend(&ctx.connect_opts).await?;
+        check_backend(ctx.config, &ctx.connect_opts).await?;
     }
 
     // Re-generate and store the queries in a separate directory from both the prepared
@@ -155,7 +167,7 @@ fn run_prepare_step(ctx: &PrepareCtx, cache_dir: &Path) -> anyhow::Result<()> {
     let tmp_dir = ctx.metadata.target_directory().join("sqlx-tmp");
     fs::create_dir_all(&tmp_dir).context(format!(
         "Failed to create temporary query cache directory: {:?}",
-        cache_dir
+        tmp_dir
     ))?;
 
     // Only delete sqlx-*.json files to avoid accidentally deleting any user data.
@@ -166,7 +178,7 @@ fn run_prepare_step(ctx: &PrepareCtx, cache_dir: &Path) -> anyhow::Result<()> {
 
     // Try only triggering a recompile on crates that use `sqlx-macros` falling back to a full
     // clean on error
-    setup_minimal_project_recompile(&ctx.cargo, &ctx.metadata, ctx.workspace)?;
+    setup_minimal_project_recompile(&ctx.cargo, &ctx.metadata, ctx.all, ctx.workspace)?;
 
     // Compile the queries.
     let check_status = {
@@ -216,10 +228,11 @@ struct ProjectRecompileAction {
 fn setup_minimal_project_recompile(
     cargo: impl AsRef<OsStr>,
     metadata: &Metadata,
+    all: bool,
     workspace: bool,
 ) -> anyhow::Result<()> {
     let recompile_action: ProjectRecompileAction = if workspace {
-        minimal_project_recompile_action(metadata)
+        minimal_project_recompile_action(metadata, all)
     } else {
         // Only touch the current crate.
         ProjectRecompileAction {
@@ -275,7 +288,7 @@ fn minimal_project_clean(
     Ok(())
 }
 
-fn minimal_project_recompile_action(metadata: &Metadata) -> ProjectRecompileAction {
+fn minimal_project_recompile_action(metadata: &Metadata, all: bool) -> ProjectRecompileAction {
     // Get all the packages that depend on `sqlx-macros`
     let mut sqlx_macros_dependents = BTreeSet::new();
     let sqlx_macros_ids: BTreeSet<_> = metadata
@@ -300,8 +313,7 @@ fn minimal_project_recompile_action(metadata: &Metadata) -> ProjectRecompileActi
         }
     }
 
-    // In-workspace dependents have their source file's mtime updated. Out-of-workspace get
-    // `cargo clean -p <PKGID>`ed
+    // In-workspace dependents have their source file's mtime updated.
     let files_to_touch: Vec<_> = in_workspace_dependents
         .iter()
         .filter_map(|id| {
@@ -311,14 +323,22 @@ fn minimal_project_recompile_action(metadata: &Metadata) -> ProjectRecompileActi
         })
         .flatten()
         .collect();
-    let packages_to_clean: Vec<_> = out_of_workspace_dependents
-        .iter()
-        .filter_map(|id| {
-            metadata
-                .package(id)
-                .map(|package| package.name().to_owned())
-        })
-        .collect();
+
+    // Out-of-workspace get `cargo clean -p <PKGID>`ed, only if --all is set.
+    let packages_to_clean: Vec<_> = if all {
+        out_of_workspace_dependents
+            .iter()
+            .filter_map(|id| {
+                metadata
+                    .package(id)
+                    .map(|package| package.name().to_owned())
+            })
+            // Do not clean sqlx, it depends on sqlx-macros but has no queries to prepare itself.
+            .filter(|name| name != "sqlx")
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     ProjectRecompileAction {
         clean_packages: packages_to_clean,
@@ -348,8 +368,8 @@ fn load_json_file(path: impl AsRef<Path>) -> anyhow::Result<serde_json::Value> {
     Ok(serde_json::from_slice(&file_bytes)?)
 }
 
-async fn check_backend(opts: &ConnectOpts) -> anyhow::Result<()> {
-    crate::connect(opts).await?.close().await?;
+async fn check_backend(config: &Config, opts: &ConnectOpts) -> anyhow::Result<()> {
+    crate::connect(config, opts).await?.close().await?;
     Ok(())
 }
 
@@ -359,6 +379,16 @@ mod tests {
     use std::assert_eq;
 
     #[test]
+    fn missing_cargo_environment_explains_prepare_invocation() {
+        let error = cargo_command(None).expect_err("missing CARGO should fail");
+
+        assert_eq!(
+            error.to_string(),
+            "the `prepare` subcommand must be invoked as `cargo sqlx prepare`; running `sqlx prepare` directly is not supported"
+        );
+    }
+
+    #[test]
     fn minimal_project_recompile_action_works() -> anyhow::Result<()> {
         let sample_metadata_path = Path::new("tests")
             .join("assets")
@@ -366,11 +396,11 @@ mod tests {
         let sample_metadata = std::fs::read_to_string(sample_metadata_path)?;
         let metadata: Metadata = sample_metadata.parse()?;
 
-        let action = minimal_project_recompile_action(&metadata);
+        let action = minimal_project_recompile_action(&metadata, false);
         assert_eq!(
             action,
             ProjectRecompileAction {
-                clean_packages: vec!["sqlx".into()],
+                clean_packages: vec![],
                 touch_paths: vec![
                     "/home/user/problematic/workspace/b_in_workspace_lib/src/lib.rs".into(),
                     "/home/user/problematic/workspace/c_in_workspace_bin/src/main.rs".into(),

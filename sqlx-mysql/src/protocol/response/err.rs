@@ -1,7 +1,7 @@
 use bytes::{Buf, Bytes};
 
 use crate::error::Error;
-use crate::io::{BufExt, Decode};
+use crate::io::{BufExt, ProtocolDecode};
 use crate::protocol::Capabilities;
 
 // https://dev.mysql.com/doc/dev/mysql-server/8.0.12/page_protocol_basic_err_packet.html
@@ -15,7 +15,7 @@ pub struct ErrPacket {
     pub error_message: String,
 }
 
-impl Decode<'_, Capabilities> for ErrPacket {
+impl ProtocolDecode<'_, Capabilities> for ErrPacket {
     fn decode_with(mut buf: Bytes, capabilities: Capabilities) -> Result<Self, Error> {
         let header = buf.get_u8();
         if header != 0xff {
@@ -25,13 +25,28 @@ impl Decode<'_, Capabilities> for ErrPacket {
             ));
         }
 
+        if buf.remaining() < 2 {
+            return Err(err_protocol!(
+                "expected error code (2 bytes) in ERR_Packet but got {} bytes",
+                buf.remaining()
+            ));
+        }
+
         let error_code = buf.get_u16_le();
         let mut sql_state = None;
 
         if capabilities.contains(Capabilities::PROTOCOL_41) {
             // If the next byte is '#' then we have a SQL STATE
-            if buf.get(0) == Some(&0x23) {
+            if buf.starts_with(b"#") {
                 buf.advance(1);
+
+                if buf.remaining() < 5 {
+                    return Err(err_protocol!(
+                        "expected SQL state (5 bytes) after '#' marker in ERR_Packet but got {} bytes",
+                        buf.remaining()
+                    ));
+                }
+
                 sql_state = Some(buf.get_str(5)?);
             }
         }
@@ -68,4 +83,26 @@ fn test_decode_err_packet_unknown_database() {
     assert_eq!(p.error_code, 1049);
     assert_eq!(p.sql_state.as_deref(), Some("42000"));
     assert_eq!(&p.error_message, "Unknown database \'unknown\'");
+}
+
+#[test]
+fn test_decode_err_packet_truncated_error_code() {
+    // only 1 byte of the 2 byte error code is present
+    const ERR_TRUNCATED_CODE: &[u8] = b"\xff\x84";
+
+    let err =
+        ErrPacket::decode_with(ERR_TRUNCATED_CODE.into(), Capabilities::PROTOCOL_41).unwrap_err();
+
+    assert!(err.to_string().contains("expected error code"), "{err}");
+}
+
+#[test]
+fn test_decode_err_packet_truncated_sql_state() {
+    // '#' marker but fewer than 5 bytes of SQL state
+    const ERR_TRUNCATED_STATE: &[u8] = b"\xff\x84\x04#420";
+
+    let err =
+        ErrPacket::decode_with(ERR_TRUNCATED_STATE.into(), Capabilities::PROTOCOL_41).unwrap_err();
+
+    assert!(err.to_string().contains("expected SQL state"), "{err}");
 }

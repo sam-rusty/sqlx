@@ -1,12 +1,12 @@
-use std::str::from_utf8;
+use std::str;
 
+use crate::collation::Collation;
+use crate::error::Error;
+use crate::io::MySqlBufExt;
+use crate::io::ProtocolDecode;
+use crate::protocol::Capabilities;
 use bitflags::bitflags;
 use bytes::{Buf, Bytes};
-
-use crate::error::Error;
-use crate::io::Decode;
-use crate::io::MySqlBufExt;
-use crate::protocol::Capabilities;
 
 // https://dev.mysql.com/doc/dev/mysql-server/8.0.12/group__group__cs__column__definition__flags.html
 
@@ -41,7 +41,7 @@ bitflags! {
         /// Field is an enumeration.
         const ENUM = 256;
 
-        /// Field is an auto-incement field.
+        /// Field is an auto-increment field.
         const AUTO_INCREMENT = 512;
 
         /// Field is a timestamp.
@@ -83,6 +83,7 @@ pub enum ColumnType {
     Year = 0x0d,
     VarChar = 0x0f,
     Bit = 0x10,
+    Vector = 0xf2,
     Json = 0xf5,
     NewDecimal = 0xf6,
     Enum = 0xf7,
@@ -104,15 +105,13 @@ pub enum ColumnType {
 pub(crate) struct ColumnDefinition {
     #[allow(unused)]
     catalog: Bytes,
-    #[allow(unused)]
     schema: Bytes,
     #[allow(unused)]
     table_alias: Bytes,
-    #[allow(unused)]
     table: Bytes,
     alias: Bytes,
     name: Bytes,
-    pub(crate) char_set: u16,
+    pub(crate) collation: Collation,
     pub(crate) max_size: u32,
     pub(crate) r#type: ColumnType,
     pub(crate) flags: ColumnFlags,
@@ -124,25 +123,33 @@ impl ColumnDefinition {
     // NOTE: strings in-protocol are transmitted according to the client character set
     //       as this is UTF-8, all these strings should be UTF-8
 
+    pub(crate) fn schema(&self) -> Result<&str, Error> {
+        str::from_utf8(&self.schema).map_err(Error::protocol)
+    }
+
+    pub(crate) fn table(&self) -> Result<&str, Error> {
+        str::from_utf8(&self.table).map_err(Error::protocol)
+    }
+
     pub(crate) fn name(&self) -> Result<&str, Error> {
-        from_utf8(&self.name).map_err(Error::protocol)
+        str::from_utf8(&self.name).map_err(Error::protocol)
     }
 
     pub(crate) fn alias(&self) -> Result<&str, Error> {
-        from_utf8(&self.alias).map_err(Error::protocol)
+        str::from_utf8(&self.alias).map_err(Error::protocol)
     }
 }
 
-impl Decode<'_, Capabilities> for ColumnDefinition {
+impl ProtocolDecode<'_, Capabilities> for ColumnDefinition {
     fn decode_with(mut buf: Bytes, _: Capabilities) -> Result<Self, Error> {
-        let catalog = buf.get_bytes_lenenc();
-        let schema = buf.get_bytes_lenenc();
-        let table_alias = buf.get_bytes_lenenc();
-        let table = buf.get_bytes_lenenc();
-        let alias = buf.get_bytes_lenenc();
-        let name = buf.get_bytes_lenenc();
-        let _next_len = buf.get_uint_lenenc(); // always 0x0c
-        let char_set = buf.get_u16_le();
+        let catalog = buf.get_bytes_lenenc()?;
+        let schema = buf.get_bytes_lenenc()?;
+        let table_alias = buf.get_bytes_lenenc()?;
+        let table = buf.get_bytes_lenenc()?;
+        let alias = buf.get_bytes_lenenc()?;
+        let name = buf.get_bytes_lenenc()?;
+        let _next_len = buf.get_uint_lenenc()?; // always 0x0c
+        let collation = buf.get_u16_le();
         let max_size = buf.get_u32_le();
         let type_id = buf.get_u8();
         let flags = buf.get_u16_le();
@@ -155,7 +162,7 @@ impl Decode<'_, Capabilities> for ColumnDefinition {
             table,
             alias,
             name,
-            char_set,
+            collation: Collation(collation),
             max_size,
             r#type: ColumnType::try_from_u16(type_id)?,
             flags: ColumnFlags::from_bits_truncate(flags),
@@ -165,13 +172,8 @@ impl Decode<'_, Capabilities> for ColumnDefinition {
 }
 
 impl ColumnType {
-    pub(crate) fn name(
-        self,
-        char_set: u16,
-        flags: ColumnFlags,
-        max_size: Option<u32>,
-    ) -> &'static str {
-        let is_binary = char_set == 63;
+    pub(crate) fn name(self, flags: ColumnFlags, max_size: Option<u32>) -> &'static str {
+        let is_binary = flags.contains(ColumnFlags::BINARY);
         let is_unsigned = flags.contains(ColumnFlags::UNSIGNED);
         let is_enum = flags.contains(ColumnFlags::ENUM);
 
@@ -201,6 +203,7 @@ impl ColumnType {
             ColumnType::Decimal | ColumnType::NewDecimal => "DECIMAL",
             ColumnType::Geometry => "GEOMETRY",
             ColumnType::Json => "JSON",
+            ColumnType::Vector => "VECTOR",
 
             ColumnType::String if is_binary => "BINARY",
             ColumnType::String if is_enum => "ENUM",
@@ -245,6 +248,7 @@ impl ColumnType {
             // [internal] 0x11 => ColumnType::Timestamp2,
             // [internal] 0x12 => ColumnType::Datetime2,
             // [internal] 0x13 => ColumnType::Time2,
+            0xf2 => ColumnType::Vector,
             0xf5 => ColumnType::Json,
             0xf6 => ColumnType::NewDecimal,
             0xf7 => ColumnType::Enum,
@@ -261,5 +265,32 @@ impl ColumnType {
                 return Err(err_protocol!("unknown column type 0x{:02x}", id));
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decodes_a_mysql_9_vector_column() {
+        // catalog "def", empty schema/table, alias and name "v", then the
+        // fixed-length fields: collation 63 (binary), max size 12, type 0xf2
+        // (VECTOR), flags BINARY, 0 decimals and two filler bytes.
+        let mut packet = vec![3, b'd', b'e', b'f', 0, 0, 0, 1, b'v', 1, b'v', 0x0c];
+        packet.extend_from_slice(&63u16.to_le_bytes());
+        packet.extend_from_slice(&12u32.to_le_bytes());
+        packet.push(0xf2);
+        packet.extend_from_slice(&ColumnFlags::BINARY.bits().to_le_bytes());
+        packet.extend_from_slice(&[0, 0, 0]);
+
+        let column =
+            ColumnDefinition::decode_with(Bytes::from(packet), Capabilities::empty()).unwrap();
+
+        assert_eq!(column.r#type, ColumnType::Vector);
+        assert_eq!(
+            column.r#type.name(column.flags, Some(column.max_size)),
+            "VECTOR"
+        );
     }
 }

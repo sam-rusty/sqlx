@@ -20,10 +20,13 @@ impl PgHasArrayType for Time {
 }
 
 impl Encode<'_, Postgres> for Time {
-    fn encode_by_ref(&self, buf: &mut PgArgumentBuffer) -> IsNull {
-        // TIME is encoded as the microseconds since midnight
-        let us = (*self - Time::MIDNIGHT).whole_microseconds() as i64;
-        Encode::<Postgres>::encode(&us, buf)
+    fn encode_by_ref(&self, buf: &mut PgArgumentBuffer) -> Result<IsNull, BoxDynError> {
+        // TIME is encoded as the microseconds since midnight.
+        //
+        // A truncating cast is fine because `self - Time::MIDNIGHT` cannot exceed a span of 24 hours.
+        #[allow(clippy::cast_possible_truncation)]
+        let micros: i64 = (*self - Time::MIDNIGHT).whole_microseconds() as i64;
+        Encode::<Postgres>::encode(micros, buf)
     }
 
     fn size_hint(&self) -> usize {
@@ -37,7 +40,17 @@ impl<'r> Decode<'r, Postgres> for Time {
             PgValueFormat::Binary => {
                 // TIME is encoded as the microseconds since midnight
                 let us = Decode::<Postgres>::decode(value)?;
-                Time::MIDNIGHT + Duration::microseconds(us)
+                let duration = Duration::microseconds(us);
+
+                // Postgres allows `24:00:00`, which would otherwise wrap around to midnight
+                if !(Duration::ZERO..Duration::DAY).contains(&duration) {
+                    return Err(format!(
+                        "Postgres TIME out of range for Time: {us} microseconds from midnight"
+                    )
+                    .into());
+                }
+
+                Time::MIDNIGHT + duration
             }
 
             PgValueFormat::Text => Time::parse(

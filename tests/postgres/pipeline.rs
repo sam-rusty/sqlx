@@ -226,11 +226,10 @@ async fn enum_arrays_as_column_and_bind() -> anyhow::Result<()> {
         .await?;
     assert_eq!(moods, vec![Mood::Sad, Mood::Ok]);
 
-    let ids: Vec<i32> =
-        sqlx::query_scalar("SELECT id FROM t WHERE moods && $1 ORDER BY id")
-            .bind(vec![Mood::Happy, Mood::Ok])
-            .fetch_all(&mut conn)
-            .await?;
+    let ids: Vec<i32> = sqlx::query_scalar("SELECT id FROM t WHERE moods && $1 ORDER BY id")
+        .bind(vec![Mood::Happy, Mood::Ok])
+        .fetch_all(&mut conn)
+        .await?;
     assert_eq!(ids, vec![1, 2]);
 
     // the element OID inside an array of a custom type is a hole in the argument buffer
@@ -312,7 +311,12 @@ async fn parse_and_bind_errors_leave_the_connection_usable() -> anyhow::Result<(
         .await
         .unwrap_err();
     // 08P01: three bytes where `int4` needs four
-    let code = error.as_database_error().unwrap().code().unwrap().into_owned();
+    let code = error
+        .as_database_error()
+        .unwrap()
+        .code()
+        .unwrap()
+        .into_owned();
     assert!(matches!(code.as_str(), "08P01" | "22P03"), "{error:?}");
     let two: i32 = sqlx::query_scalar("SELECT $1::int4")
         .bind(2)
@@ -419,7 +423,11 @@ async fn no_named_statements_with_the_cache_disabled() -> anyhow::Result<()> {
     }
     // a prepared statement object, executed later, is unnamed too
     let statement = conn.prepare("SELECT $1::int4".into_sql_str()).await?;
-    let one: i32 = statement.query_scalar().bind(1).fetch_one(&mut conn).await?;
+    let one: i32 = statement
+        .query_scalar()
+        .bind(1)
+        .fetch_one(&mut conn)
+        .await?;
     assert_eq!(one, 1);
 
     let named: i64 = sqlx::query_scalar("SELECT count(*) FROM pg_prepared_statements")
@@ -446,8 +454,8 @@ async fn describe_still_works_with_the_cache_disabled() -> anyhow::Result<()> {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn sequential_queries_reuse_one_connection_on_a_current_thread_runtime(
-) -> anyhow::Result<()> {
+async fn sequential_queries_reuse_one_connection_on_a_current_thread_runtime() -> anyhow::Result<()>
+{
     let cache = Arc::new(PgTypeCache::new());
     let (options, wire) = counted(options(&cache));
     let pool = PgPoolOptions::new()
@@ -477,8 +485,8 @@ async fn sequential_queries_reuse_one_connection_on_a_current_thread_runtime(
 }
 
 #[sqlx_macros::test]
-async fn second_connection_and_second_pool_are_seeded_from_the_shared_cache(
-) -> anyhow::Result<()> {
+async fn second_connection_and_second_pool_are_seeded_from_the_shared_cache() -> anyhow::Result<()>
+{
     schema("pl_shared").await;
     let cache = Arc::new(PgTypeCache::new());
 

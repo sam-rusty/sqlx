@@ -151,7 +151,6 @@ CREATE TYPE issue_4497_holder AS (items issue_4497_leaf_a[]);
     Ok(())
 }
 
-
 /// A one-row parent and a thousand-row child. With nested loops and merge joins off, the planner
 /// hashes whichever side is smaller, so the side of the join that gets hashed is under our control.
 async fn outer_join_tables(conn: &mut PgConnection) -> anyhow::Result<()> {

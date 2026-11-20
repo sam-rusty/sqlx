@@ -46,10 +46,10 @@ pub struct PgConnectOptions {
     pub(crate) allow_missing_parse_complete: bool,
 }
 
+type SocketFactoryFn = dyn Fn() -> BoxFuture<'static, Result<Box<dyn Socket>, Error>> + Send + Sync;
+
 #[derive(Clone)]
-pub(crate) struct SocketFactory(
-    pub(crate) Arc<dyn Fn() -> BoxFuture<'static, Result<Box<dyn Socket>, Error>> + Send + Sync>,
-);
+pub(crate) struct SocketFactory(pub(crate) Arc<SocketFactoryFn>);
 
 impl fmt::Debug for SocketFactory {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
